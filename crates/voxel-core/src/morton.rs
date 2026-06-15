@@ -47,9 +47,16 @@ const fn compact_by_3(v: u64) -> u32 {
 }
 
 /// Interleaves `(x, y, z)` into a 64-bit Morton code (`x` in the low bit of
-/// each triple). Inputs must be `≤ MAX_MORTON_COORD`; higher bits are dropped.
+/// each triple). Inputs must be `≤ MAX_MORTON_COORD`; higher bits are dropped
+/// (and silently collide), so this codec supports resolutions only up to
+/// `k = 10` (`n = 8_388_608`). The `debug_assert` makes a higher-`k` misuse
+/// loud in tests rather than corrupting the Morton ordering silently.
 #[must_use]
 pub const fn encode(x: u32, y: u32, z: u32) -> u64 {
+    debug_assert!(
+        x <= MAX_MORTON_COORD && y <= MAX_MORTON_COORD && z <= MAX_MORTON_COORD,
+        "morton::encode coordinate exceeds the 21-bit-per-axis range"
+    );
     split_by_3(x) | (split_by_3(y) << 1) | (split_by_3(z) << 2)
 }
 

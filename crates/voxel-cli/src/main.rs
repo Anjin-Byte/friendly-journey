@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use glam::DVec3;
-use voxel_core::fixtures::{Checkerboard, Dust, OctantFractal, Solid, WireLattice};
+use voxel_core::fixtures::{Checkerboard, Dust, NoiseField, OctantFractal, Solid, WireLattice};
 use voxel_core::{
     Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, measure, mirror_traverse,
 };
@@ -35,6 +35,9 @@ enum Command {
     /// orientation — the algorithmic (cell-step) anisotropy vs the hardware
     /// (GPU-time) anisotropy, decomposing how much of the swing is addressable.
     Aniso(AnisoArgs),
+    /// Time incremental voxel edits (in-place vs topology) against a full
+    /// rebuild — the cost of dynamic geometry.
+    Edit(EditArgs),
 }
 
 #[derive(Args)]
@@ -98,6 +101,19 @@ struct AnisoArgs {
     verbose: bool,
 }
 
+#[derive(Args)]
+struct EditArgs {
+    /// Occupancy fixture to build, then edit.
+    #[arg(long, value_enum, default_value_t = Fixture::Caves)]
+    fixture: Fixture,
+    /// Grid resolution per axis (`8·4^k`).
+    #[arg(long, default_value_t = 512)]
+    res: u32,
+    /// Number of random voxel toggles to time.
+    #[arg(long, default_value_t = 20_000)]
+    edits: u32,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Fixture {
     /// Sierpinski tetrahedron, `D = 2`.
@@ -112,6 +128,10 @@ enum Fixture {
     WireLattice,
     /// Sparse hashed noise — warp-divergence stress (#4).
     Dust,
+    /// Perlin fBm isosurface — smooth organic clouds/caves.
+    Perlin,
+    /// Domain-warped ridged multifractal — interconnected veins/caverns.
+    Caves,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -141,7 +161,108 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Aniso(args) => aniso_cmd(&args),
+        Command::Edit(args) => {
+            edit_cmd(&args);
+            Ok(())
+        }
     }
+}
+
+/// Tiny splitmix64 step, mapped to a coordinate in `0..n`.
+fn rng_coord(state: &mut u64, n: u32) -> u32 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    u32::try_from(z % u64::from(n)).unwrap_or(0)
+}
+
+/// Times incremental edits (in-place and topology) against a full rebuild.
+#[allow(clippy::cast_precision_loss)]
+fn edit_cmd(args: &EditArgs) {
+    let Ok(resolution) = Resolution::new(args.res) else {
+        eprintln!("invalid resolution {} (must be 8·4^k)", args.res);
+        return;
+    };
+    let n = resolution.voxels_per_axis();
+
+    // Baseline: a full build — the O(n³) scan any change costs today.
+    let t = std::time::Instant::now();
+    let mut tree = build_tree(args.fixture, resolution);
+    let full_build = t.elapsed();
+    tracing::info!(
+        nodes = tree.node_count(),
+        leaves = tree.leaf_count(),
+        "structure built"
+    );
+
+    // Time random voxel toggles incrementally, split by what each edit did.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut leaf = (std::time::Duration::ZERO, 0u64);
+    let mut topo = (std::time::Duration::ZERO, 0u64);
+    for _ in 0..args.edits {
+        let c = VoxelCoord::new(
+            rng_coord(&mut state, n),
+            rng_coord(&mut state, n),
+            rng_coord(&mut state, n),
+        );
+        let occupied = !tree.is_occupied(c); // always a real change
+        let t = std::time::Instant::now();
+        let kind = tree.set_voxel(c, occupied);
+        let dt = t.elapsed();
+        match kind {
+            voxel_core::Edit::Leaf(_) => {
+                leaf.0 += dt;
+                leaf.1 += 1;
+            }
+            voxel_core::Edit::Topology => {
+                topo.0 += dt;
+                topo.1 += 1;
+            }
+            voxel_core::Edit::Unchanged => {}
+        }
+    }
+
+    let full_s = full_build.as_secs_f64();
+    let per = |d: std::time::Duration, count: u64| {
+        if count == 0 {
+            0.0
+        } else {
+            d.as_secs_f64() / count as f64
+        }
+    };
+    let leaf_s = per(leaf.0, leaf.1);
+    let topo_s = per(topo.0, topo.1);
+
+    println!(
+        "edit cost — {} {n}³  ({} random toggles)",
+        fixture_name(args.fixture),
+        args.edits
+    );
+    println!(
+        "  full rebuild (scan):            {:>10.2} ms   ← today's cost for ANY change",
+        full_s * 1e3
+    );
+    if leaf.1 > 0 {
+        println!(
+            "  in-place edit (Edit::Leaf):     {:>10.3} µs/edit   (N={:>6})  → {:.0}× cheaper",
+            leaf_s * 1e6,
+            leaf.1,
+            full_s / leaf_s.max(1e-12),
+        );
+    }
+    if topo.1 > 0 {
+        println!(
+            "  topology edit (Edit::Topology): {:>10.3} ms/edit   (N={:>6})  → {:.0}× cheaper",
+            topo_s * 1e3,
+            topo.1,
+            full_s / topo_s.max(1e-12),
+        );
+    }
+    println!(
+        "  (in-place = O(1) + a one-leaf GPU patch; topology rebuilds node levels\n   O(bricks), scan-free — a batch of edits rebuilds once.)"
+    );
 }
 
 /// Builds the sparse structure for `fixture` at `resolution`.
@@ -155,6 +276,8 @@ fn build_tree(fixture: Fixture, resolution: Resolution) -> SparseTree {
         Fixture::Solid => SparseTree::build(&Solid { resolution }),
         Fixture::WireLattice => SparseTree::build(&WireLattice::new(resolution)),
         Fixture::Dust => SparseTree::build(&Dust::new(resolution)),
+        Fixture::Perlin => SparseTree::build(&NoiseField::perlin(resolution)),
+        Fixture::Caves => SparseTree::build(&NoiseField::caves(resolution)),
     }
 }
 
@@ -391,6 +514,8 @@ fn fixture_name(f: Fixture) -> &'static str {
         Fixture::Solid => "solid",
         Fixture::WireLattice => "wire-lattice",
         Fixture::Dust => "dust",
+        Fixture::Perlin => "perlin",
+        Fixture::Caves => "caves",
     }
 }
 

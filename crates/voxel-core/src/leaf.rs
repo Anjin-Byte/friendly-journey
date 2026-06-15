@@ -86,6 +86,20 @@ impl LeafBrick {
         self.set_morton(morton::encode_brick(x, y, z));
     }
 
+    /// Clears the bit at intra-brick Morton index `i` (`0..512`).
+    ///
+    /// # Panics
+    /// Panics if `i >= 512` — a programmer error in index computation.
+    pub fn clear_morton(&mut self, i: u32) {
+        assert!(i < 512, "leaf Morton index out of range: {i}");
+        self.bits[(i >> 6) as usize] &= !(1u64 << (i & 63));
+    }
+
+    /// Clears the bit for intra-brick voxel coordinate `(x, y, z)` (each `0..8`).
+    pub fn clear_local(&mut self, x: u32, y: u32, z: u32) {
+        self.clear_morton(morton::encode_brick(x, y, z));
+    }
+
     /// Reads the bit for intra-brick voxel coordinate `(x, y, z)` (each `0..8`).
     #[must_use]
     pub fn get_local(&self, x: u32, y: u32, z: u32) -> bool {

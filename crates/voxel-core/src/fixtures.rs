@@ -6,6 +6,7 @@
 //! box-counting dimension is exactly `log₂(|keep|)` — a *known* ground truth
 //! for the §10 dimension estimator.
 
+use crate::noise::{Fractal, domain_warp, fractal};
 use crate::{OccupancyField, Resolution, VoxelCoord};
 
 /// Empty everywhere. The MISS-only fixture.
@@ -235,12 +236,202 @@ impl OccupancyField for Dust {
     }
 }
 
+/// A 3-D noise field thresholded into occupancy — organic blobs, caves, and
+/// veins instead of a regular or fractal structure.
+///
+/// A voxel at normalized position `p ∈ [0,1)³` (scaled to [`frequency`] periods
+/// across the grid) is occupied iff a fractal-noise value exceeds
+/// [`threshold`]. With [`warp`] `> 0` the sampling point is first
+/// domain-warped, which bends the isosurface into
+/// swirls and overhangs; with [`ridged`] the fractal sum uses ridged
+/// multifractal octaves (sharp veins/tunnels) rather than plain fBm.
+///
+/// The macro structure is **resolution-independent** (it scales with
+/// `frequency`, not voxel count), so higher resolutions reveal more octave
+/// detail on the same shapes. Deterministic via [`seed`], so builds and tests
+/// reproduce.
+///
+/// [`frequency`]: Self::frequency
+/// [`threshold`]: Self::threshold
+/// [`warp`]: Self::warp
+/// [`ridged`]: Self::ridged
+/// [`seed`]: Self::seed
+#[derive(Debug, Clone, Copy)]
+pub struct NoiseField {
+    /// Grid resolution.
+    pub resolution: Resolution,
+    /// Seed; changes the field while preserving its statistics.
+    pub seed: u32,
+    /// Base feature frequency in periods across the whole grid.
+    pub frequency: f64,
+    /// Number of fractal octaves.
+    pub octaves: u32,
+    /// Frequency multiplier between octaves.
+    pub lacunarity: f64,
+    /// Amplitude multiplier between octaves.
+    pub gain: f64,
+    /// Ridged multifractal (veins/tunnels) instead of plain fBm (blobs).
+    pub ridged: bool,
+    /// Domain-warp amplitude (`0` disables warping).
+    pub warp: f64,
+    /// Occupied iff the (warped) fractal value exceeds this, in ~`[-1, 1]`.
+    pub threshold: f64,
+}
+
+impl NoiseField {
+    /// Smooth fBm "clouds/caves": an unwarped isosurface of 5-octave gradient
+    /// noise (~⅓ filled). The classic Perlin look.
+    #[must_use]
+    pub const fn perlin(resolution: Resolution) -> Self {
+        Self {
+            resolution,
+            seed: 0x5eed_1234,
+            frequency: 5.0,
+            octaves: 5,
+            lacunarity: 2.0,
+            gain: 0.5,
+            ridged: false,
+            warp: 0.0,
+            threshold: 0.12,
+        }
+    }
+
+    /// Domain-warped ridged multifractal: interconnected veins/caverns with
+    /// swirls and overhangs — the "more complex, interesting features" preset.
+    #[must_use]
+    pub const fn caves(resolution: Resolution) -> Self {
+        Self {
+            resolution,
+            seed: 0xca5e_5eed,
+            frequency: 4.0,
+            octaves: 5,
+            lacunarity: 2.0,
+            gain: 0.5,
+            ridged: true,
+            warp: 0.45,
+            threshold: 0.48,
+        }
+    }
+
+    /// The `[0,1)³`-normalized, frequency-scaled sample point for voxel `c`.
+    fn sample_point(&self, c: VoxelCoord) -> [f64; 3] {
+        let n = f64::from(self.resolution.voxels_per_axis());
+        let s = self.frequency / n;
+        [
+            (f64::from(c.x) + 0.5) * s,
+            (f64::from(c.y) + 0.5) * s,
+            (f64::from(c.z) + 0.5) * s,
+        ]
+    }
+
+    /// The fractal field value at voxel `c` (warped if configured), in ~`[-1,1]`.
+    fn value(&self, c: VoxelCoord) -> f64 {
+        let f = Fractal {
+            octaves: self.octaves,
+            lacunarity: self.lacunarity,
+            gain: self.gain,
+            ridged: self.ridged,
+        };
+        let mut p = self.sample_point(c);
+        if self.warp > 0.0 {
+            // Warp with a cheaper low-octave field (keeps large builds tractable).
+            let warp_f = Fractal {
+                octaves: self.octaves.min(3),
+                ..f
+            };
+            p = domain_warp(self.seed, p, self.warp, warp_f);
+        }
+        fractal(self.seed, p, f)
+    }
+}
+
+impl OccupancyField for NoiseField {
+    fn resolution(&self) -> Resolution {
+        self.resolution
+    }
+
+    fn is_occupied(&self, c: VoxelCoord) -> bool {
+        c.in_bounds(self.resolution) && self.value(c) > self.threshold
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn res(n: u32) -> Resolution {
         Resolution::new(n).unwrap()
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn fill_fraction<F: OccupancyField>(f: &F) -> f64 {
+        let n = f.resolution().voxels_per_axis();
+        let mut count = 0u64;
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    if f.is_occupied(VoxelCoord::new(x, y, z)) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count as f64 / f64::from(n).powi(3)
+    }
+
+    #[test]
+    fn noise_presets_have_sane_fill() {
+        // Both presets should be partially filled — enough structure to see
+        // surfaces, sparse enough to be distinct from the dense fixtures.
+        let r = res(128);
+        let perlin = fill_fraction(&NoiseField::perlin(r));
+        let caves = fill_fraction(&NoiseField::caves(r));
+        assert!(
+            (0.15..0.40).contains(&perlin),
+            "perlin fill {perlin} off target"
+        );
+        assert!(
+            (0.12..0.35).contains(&caves),
+            "caves fill {caves} off target"
+        );
+    }
+
+    #[test]
+    fn noise_is_deterministic_and_bounded() {
+        let r = res(32);
+        let f = NoiseField::caves(r);
+        // Deterministic per voxel, and false out of bounds.
+        let c = VoxelCoord::new(10, 20, 30);
+        assert_eq!(f.is_occupied(c), f.is_occupied(c));
+        assert!(!f.is_occupied(VoxelCoord::new(32, 0, 0)));
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn noise_seed_changes_the_field() {
+        // A different seed yields a meaningfully different occupancy set.
+        let r = res(32);
+        let a = NoiseField::perlin(r);
+        let b = NoiseField {
+            seed: a.seed ^ 0xABCD,
+            ..a
+        };
+        let n = r.voxels_per_axis();
+        let mut diff = 0u64;
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    let c = VoxelCoord::new(x, y, z);
+                    if a.is_occupied(c) != b.is_occupied(c) {
+                        diff += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            diff > u64::from(n).pow(3) / 100,
+            "seed barely changed the field"
+        );
     }
 
     #[test]

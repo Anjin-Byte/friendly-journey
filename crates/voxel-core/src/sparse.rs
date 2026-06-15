@@ -30,6 +30,37 @@ pub struct SparseTree {
     nodes: Vec<Vec<GpuNode>>,
     /// Non-empty leaf bricks, sorted by brick Morton code.
     leaves: Vec<LeafBrick>,
+    /// Brick Morton codes, parallel to and in the same order as `leaves`
+    /// (ascending). Retained to support incremental edits ([`SparseTree::set_voxel`]):
+    /// a topology change binary-searches and splices this list, then rebuilds the
+    /// node levels from it — skipping the `O(n³)` occupancy scan.
+    codes: Vec<u64>,
+    /// Monotonic counter bumped on every topology change (a brick appearing or
+    /// disappearing). A [`SchoolBBuffer`] records this at `from_sparse` time and
+    /// asserts it is unchanged before an in-place [`patch_leaf`](crate::SchoolBBuffer::patch_leaf):
+    /// a topology edit renumbers leaf indices, so a stale patch would corrupt the
+    /// buffer silently — this turns that into a loud panic.
+    topo_gen: u64,
+}
+
+/// What an edit ([`SparseTree::set_voxel`]) did to the structure — and therefore
+/// how little a GPU adapter must re-upload to stay in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    /// The voxel already had the requested state; nothing changed.
+    Unchanged,
+    /// Exactly one leaf brick changed *in place* (the given leaf index): relative
+    /// to the immediately-prior tree state, the Morton order, node masks, and all
+    /// indices are unchanged, so the adapter need only re-upload that one leaf's
+    /// words and bounds. (Indices are *not* stable across an intervening
+    /// [`Topology`](Self::Topology) edit — see [`SchoolBBuffer::patch_leaf`].)
+    ///
+    /// [`SchoolBBuffer::patch_leaf`]: crate::SchoolBBuffer::patch_leaf
+    Leaf(u32),
+    /// A brick appeared or disappeared: the leaf array and node levels were
+    /// rebuilt (no scan). Leaf indices have shifted; the adapter must
+    /// re-serialize and re-upload the structure.
+    Topology,
 }
 
 /// Groups a sorted list of child Morton codes into `4³` parent nodes.
@@ -43,8 +74,7 @@ fn build_parents(child_codes: &[u64]) -> (Vec<GpuNode>, Vec<u64>) {
     let mut i = 0;
     while i < child_codes.len() {
         let parent = child_codes[i] >> 6;
-        let child_base =
-            u32::try_from(i).expect("child index exceeds u32 (resolution far beyond 2048³)");
+        let child_base = u32::try_from(i).expect("stored child count exceeds u32::MAX");
         let mut mask = 0u64;
         while i < child_codes.len() && (child_codes[i] >> 6) == parent {
             mask |= 1u64 << (child_codes[i] & 63);
@@ -54,6 +84,31 @@ fn build_parents(child_codes: &[u64]) -> (Vec<GpuNode>, Vec<u64>) {
         parent_codes.push(parent);
     }
     (nodes, parent_codes)
+}
+
+/// Builds the internal node levels `2..=k+1` bottom-up from the (ascending)
+/// leaf-brick Morton codes by repeatedly OR-reducing `4³` groups. `nodes[L]`
+/// holds level-`L` nodes; indices `0`/`1` are unused. Shared by [`SparseTree::build`]
+/// (after the scan) and [`SparseTree::set_voxel`] (after a topology splice) — the
+/// latter is why it is `O(bricks)` and scan-free.
+fn build_levels(k: u32, leaf_codes: &[u64]) -> Vec<Vec<GpuNode>> {
+    let mut nodes: Vec<Vec<GpuNode>> = vec![Vec::new(); (k + 2) as usize];
+    if leaf_codes.is_empty() {
+        return nodes;
+    }
+    let mut codes = leaf_codes.to_vec();
+    for level in 2..=(k + 1) {
+        let (parents, parent_codes) = build_parents(&codes);
+        nodes[level as usize] = parents;
+        codes = parent_codes;
+    }
+    nodes
+}
+
+/// Narrows a leaf-array index to the `u32` used by [`Edit::Leaf`] and the GPU
+/// buffers (leaf counts are bounded well below `u32::MAX` by the build).
+fn leaf_index(idx: usize) -> u32 {
+    u32::try_from(idx).expect("stored leaf count exceeds u32::MAX")
 }
 
 /// Enumerates occupied bricks in the z-slab `[bz_lo, bz_hi)` — the parallel
@@ -124,21 +179,85 @@ impl SparseTree {
         // 2. Sort by Morton code (codes are unique, so order is total).
         bricks.sort_unstable_by_key(|(code, _)| *code);
         let leaves: Vec<LeafBrick> = bricks.iter().map(|(_, leaf)| *leaf).collect();
-        let mut codes: Vec<u64> = bricks.into_iter().map(|(code, _)| code).collect();
+        let codes: Vec<u64> = bricks.into_iter().map(|(code, _)| code).collect();
 
         // 3–4. Build internal levels 2..=k+1 bottom-up by OR-reducing 4³ groups.
-        let mut nodes: Vec<Vec<GpuNode>> = vec![Vec::new(); (k + 2) as usize];
-        for level in 2..=(k + 1) {
-            let (parents, parent_codes) = build_parents(&codes);
-            nodes[level as usize] = parents;
-            codes = parent_codes;
-        }
+        let nodes = build_levels(k, &codes);
 
         Self {
             resolution,
             nodes,
             leaves,
+            codes,
+            topo_gen: 0,
         }
+    }
+
+    /// The topology generation — bumped each time a brick appears or disappears.
+    /// A [`SchoolBBuffer`](crate::SchoolBBuffer) uses it to detect a stale
+    /// in-place patch (see [`patch_leaf`](crate::SchoolBBuffer::patch_leaf)).
+    #[must_use]
+    pub fn topology_generation(&self) -> u64 {
+        self.topo_gen
+    }
+
+    /// Sets or clears voxel `c`, updating the structure incrementally, and
+    /// reports what changed (see [`Edit`]). An out-of-bounds or no-op edit
+    /// returns [`Edit::Unchanged`].
+    ///
+    /// In-place edits (a brick that stays non-empty) are `O(1)`; topology edits
+    /// (a brick appearing/disappearing) splice the sorted leaf/code arrays and
+    /// rebuild the node levels in `O(bricks)` — skipping the `O(n³)` occupancy
+    /// scan that dominates a full [`build`](Self::build).
+    pub fn set_voxel(&mut self, c: VoxelCoord, occupied: bool) -> Edit {
+        if !c.in_bounds(self.resolution) {
+            return Edit::Unchanged;
+        }
+        let code = crate::morton::encode(c.x >> 3, c.y >> 3, c.z >> 3);
+        let (lx, ly, lz) = (c.x & 7, c.y & 7, c.z & 7);
+
+        match self.codes.binary_search(&code) {
+            Ok(idx) => {
+                let leaf = &mut self.leaves[idx];
+                if leaf.get_local(lx, ly, lz) == occupied {
+                    return Edit::Unchanged; // already in the requested state
+                }
+                if occupied {
+                    leaf.set_local(lx, ly, lz);
+                    Edit::Leaf(leaf_index(idx))
+                } else {
+                    leaf.clear_local(lx, ly, lz);
+                    if leaf.is_empty() {
+                        // Last voxel removed → the brick disappears (topology).
+                        self.leaves.remove(idx);
+                        self.codes.remove(idx);
+                        self.rebuild_levels();
+                        Edit::Topology
+                    } else {
+                        Edit::Leaf(leaf_index(idx))
+                    }
+                }
+            }
+            Err(insert_at) => {
+                if !occupied {
+                    return Edit::Unchanged; // clearing a voxel in an empty brick
+                }
+                // A new brick appears (topology).
+                let mut leaf = LeafBrick::EMPTY;
+                leaf.set_local(lx, ly, lz);
+                self.leaves.insert(insert_at, leaf);
+                self.codes.insert(insert_at, code);
+                self.rebuild_levels();
+                Edit::Topology
+            }
+        }
+    }
+
+    /// Rebuilds the internal node levels from the current `codes` (scan-free)
+    /// and bumps the topology generation (leaf indices have changed).
+    fn rebuild_levels(&mut self) {
+        self.nodes = build_levels(self.resolution.internal_levels(), &self.codes);
+        self.topo_gen = self.topo_gen.wrapping_add(1);
     }
 
     /// The grid resolution.
@@ -272,6 +391,7 @@ impl NodeLayout for SparseTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BitGrid;
     use crate::fixtures::{Checkerboard, Empty, OctantFractal, SingleVoxel, Solid};
     use crate::oracle;
     use glam::DVec3;
@@ -402,5 +522,139 @@ mod tests {
             }
         }
         assert!(compared > 1000);
+    }
+
+    /// The edit correctness gate: a tree mutated by a long sequence of random
+    /// voxel toggles must be **byte-for-byte identical** to a fresh build of the
+    /// same edited field — same leaves, same codes, same node levels — and agree
+    /// with the reference field on every voxel. This is the incremental-edit
+    /// analogue of the oracle differential.
+    #[test]
+    fn incremental_edits_match_fresh_build() {
+        let r = res(32); // k = 1: exercises a real internal node level
+        let n = r.voxels_per_axis();
+        let base = OctantFractal::sierpinski_tetrahedron(r);
+        let mut grid = BitGrid::from_field(&base); // mutable reference field
+        let mut tree = SparseTree::build(&base);
+
+        let mut state = 0xED17_0000_0000_0001u64;
+        let rc = |s: &mut u64| u32::try_from(splitmix64(s) % u64::from(n)).unwrap();
+        let (mut leaf_edits, mut topo_edits) = (0u32, 0u32);
+        for _ in 0..4000 {
+            let c = VoxelCoord::new(rc(&mut state), rc(&mut state), rc(&mut state));
+            let occ = !grid.is_occupied(c); // always a real change
+            if occ {
+                grid.set(c);
+            } else {
+                grid.clear(c);
+            }
+            match tree.set_voxel(c, occ) {
+                Edit::Leaf(_) => leaf_edits += 1,
+                Edit::Topology => topo_edits += 1,
+                Edit::Unchanged => panic!("a toggle must change something at {c:?}"),
+            }
+        }
+
+        let fresh = SparseTree::build(&grid);
+        assert_eq!(tree.codes, fresh.codes, "code arrays diverged");
+        assert_eq!(tree.leaves, fresh.leaves, "leaf arrays diverged");
+        assert_eq!(tree.nodes, fresh.nodes, "node levels diverged");
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    let c = VoxelCoord::new(x, y, z);
+                    assert_eq!(tree.is_occupied(c), grid.is_occupied(c), "voxel {c:?}");
+                }
+            }
+        }
+        assert!(
+            leaf_edits > 0 && topo_edits > 0,
+            "want both edit kinds exercised: leaf={leaf_edits} topo={topo_edits}"
+        );
+    }
+
+    /// Pins the [`Edit`] classification an adapter relies on to decide how much
+    /// to re-upload.
+    #[test]
+    fn edit_classification_is_correct() {
+        let r = res(32);
+        let mut tree = SparseTree::build(&Empty { resolution: r });
+        let v = VoxelCoord::new;
+
+        // First voxel in an empty region → a brick appears (topology).
+        assert_eq!(tree.set_voxel(v(0, 0, 0), true), Edit::Topology);
+        // Another voxel in the same (now-occupied) brick → in-place.
+        assert!(matches!(tree.set_voxel(v(1, 0, 0), true), Edit::Leaf(_)));
+        // Re-setting an already-set voxel → no change.
+        assert_eq!(tree.set_voxel(v(1, 0, 0), true), Edit::Unchanged);
+        // Clearing one of two voxels (brick stays non-empty) → in-place.
+        assert!(matches!(tree.set_voxel(v(1, 0, 0), false), Edit::Leaf(_)));
+        // Clearing the last voxel → the brick disappears (topology).
+        assert_eq!(tree.set_voxel(v(0, 0, 0), false), Edit::Topology);
+        // Clearing a voxel in an already-empty brick → no change.
+        assert_eq!(tree.set_voxel(v(0, 0, 0), false), Edit::Unchanged);
+        // Out of bounds → no change.
+        assert_eq!(tree.set_voxel(v(32, 0, 0), true), Edit::Unchanged);
+        assert_eq!(tree.leaf_count(), 0);
+    }
+
+    /// Edits at `k = 0` (a single `8³` brick, no internal nodes): the brick is
+    /// the root, so add/remove toggles the root leaf directly.
+    #[test]
+    fn edits_handle_single_brick_resolution() {
+        let r = res(8);
+        let mut tree = SparseTree::build(&Empty { resolution: r });
+        let v = VoxelCoord::new;
+
+        assert_eq!(tree.set_voxel(v(2, 3, 4), true), Edit::Topology); // root leaf appears
+        assert_eq!(tree.leaf_count(), 1);
+        assert_eq!(tree.node_count(), 0);
+        assert!(tree.is_occupied(v(2, 3, 4)));
+        assert!(matches!(tree.set_voxel(v(5, 6, 7), true), Edit::Leaf(_)));
+        assert!(matches!(tree.set_voxel(v(2, 3, 4), false), Edit::Leaf(_)));
+        assert_eq!(tree.set_voxel(v(5, 6, 7), false), Edit::Topology); // root leaf removed
+        assert_eq!(tree.leaf_count(), 0);
+        assert!(!tree.is_occupied(v(5, 6, 7)));
+        // Matches a fresh build of the now-empty field.
+        let empty = SparseTree::build(&Empty { resolution: r });
+        assert_eq!(tree.leaves, empty.leaves);
+        assert_eq!(tree.codes, empty.codes);
+    }
+
+    /// Building up from empty and tearing back down to empty both reproduce a
+    /// fresh build at each end.
+    #[test]
+    fn edits_from_empty_and_back_to_empty() {
+        let r = res(32);
+        let target = OctantFractal::sierpinski_tetrahedron(r);
+        let n = r.voxels_per_axis();
+
+        // Build the target field up voxel by voxel from empty.
+        let mut tree = SparseTree::build(&Empty { resolution: r });
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    let c = VoxelCoord::new(x, y, z);
+                    if target.is_occupied(c) {
+                        tree.set_voxel(c, true);
+                    }
+                }
+            }
+        }
+        let fresh = SparseTree::build(&target);
+        assert_eq!(tree.codes, fresh.codes);
+        assert_eq!(tree.leaves, fresh.leaves);
+        assert_eq!(tree.nodes, fresh.nodes);
+
+        // Tear it all back down to empty.
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    tree.set_voxel(VoxelCoord::new(x, y, z), false);
+                }
+            }
+        }
+        assert_eq!(tree.leaf_count(), 0);
+        assert_eq!(tree.node_count(), 0);
     }
 }

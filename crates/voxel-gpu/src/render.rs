@@ -43,6 +43,18 @@ pub struct GpuCamera {
     pub dims: [u32; 4],
 }
 
+/// Reusable compute-pass timestamp resources (present iff the device supports
+/// `TIMESTAMP_QUERY`): a 2-slot query set and the resolve/readback buffers.
+/// Mirrors the traverser's timing so the viewer's render kernel can be measured
+/// on the GPU timeline (readback of two timestamps only, no per-pixel copy).
+struct RenderTiming {
+    query_set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick.
+    period: f32,
+}
+
 /// A compiled render pipeline with one uploaded structure.
 pub struct GpuRenderer {
     device: wgpu::Device,
@@ -53,6 +65,7 @@ pub struct GpuRenderer {
     leaf_buf: wgpu::Buffer,
     bounds_buf: wgpu::Buffer,
     camera_buf: wgpu::Buffer,
+    timing: Option<RenderTiming>,
 }
 
 impl GpuRenderer {
@@ -111,6 +124,32 @@ impl GpuRenderer {
             cache: None,
         });
 
+        let timing = ctx.supports_timestamps().then(|| {
+            let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("render timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render ts resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render ts readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            RenderTiming {
+                query_set,
+                resolve,
+                readback,
+                period: queue.get_timestamp_period(),
+            }
+        });
+
         Ok(Self {
             device,
             queue,
@@ -120,7 +159,14 @@ impl GpuRenderer {
             leaf_buf,
             bounds_buf,
             camera_buf,
+            timing,
         })
+    }
+
+    /// Whether this renderer can report a GPU-timeline kernel time (i.e. the
+    /// device supports compute-pass timestamp queries).
+    pub fn supports_timing(&self) -> bool {
+        self.timing.is_some()
     }
 
     /// Records the render compute pass into `encoder`, writing the shaded image
@@ -133,6 +179,37 @@ impl GpuRenderer {
         output: &wgpu::TextureView,
         width: u32,
         height: u32,
+    ) {
+        self.record(encoder, camera, output, width, height, false);
+    }
+
+    /// Like [`render`](Self::render), but brackets the compute pass with
+    /// timestamp queries and appends their resolve+copy to `encoder` (when the
+    /// device supports timestamps). After the caller submits `encoder` and the
+    /// GPU completes, [`last_kernel_ns`](Self::last_kernel_ns) returns the
+    /// traverse+shade time in nanoseconds. With no timestamp support this is
+    /// identical to [`render`](Self::render) and `last_kernel_ns` yields `None`.
+    pub fn render_timed(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &GpuCamera,
+        output: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        self.record(encoder, camera, output, width, height, true);
+    }
+
+    /// Shared pass recorder; when `timed` and timestamps are available, writes
+    /// the begin/end timestamps and resolves them into the readback buffer.
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &GpuCamera,
+        output: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        timed: bool,
     ) {
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(camera));
@@ -149,12 +226,53 @@ impl GpuRenderer {
             ],
         });
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("render pass"),
-            timestamp_writes: None,
+        let timing = if timed { self.timing.as_ref() } else { None };
+        let timestamp_writes = timing.map(|t| wgpu::ComputePassTimestampWrites {
+            query_set: &t.query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
         });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("render pass"),
+                timestamp_writes,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+
+        if let Some(t) = timing {
+            encoder.resolve_query_set(&t.query_set, 0..2, &t.resolve, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, 16);
+        }
+    }
+
+    /// Maps the most recent [`render_timed`](Self::render_timed) timestamp pair
+    /// and returns the compute-pass duration in nanoseconds, or `None` when the
+    /// device lacks timestamp support. Call after the encoder has been submitted
+    /// and the device polled to completion.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn last_kernel_ns(&self) -> Result<Option<f64>, GpuError> {
+        let Some(t) = self.timing.as_ref() else {
+            return Ok(None);
+        };
+        let slice = t.readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|_| GpuError::Poll)?;
+        rx.recv().map_err(|_| GpuError::Poll)??;
+
+        let data = slice.get_mapped_range();
+        let begin = u64::from_le_bytes(data[0..8].try_into().expect("8 bytes"));
+        let end = u64::from_le_bytes(data[8..16].try_into().expect("8 bytes"));
+        drop(data);
+        t.readback.unmap();
+        Ok(Some(end.saturating_sub(begin) as f64 * f64::from(t.period)))
     }
 }

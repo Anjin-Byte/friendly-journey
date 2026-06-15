@@ -20,6 +20,13 @@ glam = { workspace = true }
 anyhow = { workspace = true }
 pollster = { workspace = true }
 clap = { workspace = true }
+bytemuck = { workspace = true }
+
+# Leaf data dependency (public-domain 8x8 bitmap font), local to this UI binary:
+# pure const tables, no_std, no churn, no wgpu coupling — used only to build the
+# HUD glyph atlas. Kept crate-local rather than hoisted into workspace.deps
+# (Engineering Codex: Shared Dependencies — viewer-only deps stay local).
+font8x8 = "0.3"
 
 [lints]
 workspace = true

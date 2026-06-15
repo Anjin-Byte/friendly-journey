@@ -3,12 +3,17 @@
 //! Fully GPU-resident: a compute pass builds a camera ray per pixel, traverses
 //! the structure, shades the hit, and writes color to a texture (the same
 //! `traverse_ray` the `voxel-gpu` differential validates); a fullscreen blit
-//! draws that texture to the window. No per-frame readback, CPU ray-gen, or CPU
-//! shading. This binary is the only holder of a windowing dependency, keeping
-//! the headless `voxel` cli UI-free (Engineering Codex: *Headless First*).
+//! draws that texture to the window, and a small overlay draws the HUD. No
+//! per-frame readback of the image, CPU ray-gen, or CPU shading. This binary is
+//! the only holder of a windowing dependency, keeping the headless `voxel` cli
+//! UI-free (Engineering Codex: *Headless First*).
 //!
-//! Prints build time and a rolling per-frame profile (encode / GPU / present)
-//! to stderr.
+//! Two cameras share the renderer: a deterministic orbit (the default, and the
+//! path the scripted `--frames` profiling run uses) and an interactive free-fly
+//! camera (`WASD`+`QE` to move, drag to look, scroll for speed). The first
+//! manual input hands control to the fly camera; `Tab` toggles back. The HUD
+//! (`H` to toggle) shows FPS, frame/kernel times, scene info, and a frame-time
+//! sparkline — so the orientation cost swing is visible while orbiting.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -16,20 +21,31 @@
     clippy::cast_sign_loss
 )]
 
+mod camera;
+mod hud;
+mod input;
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use glam::Vec3;
-use voxel_core::fixtures::{Checkerboard, Dust, OctantFractal, WireLattice};
+use voxel_core::fixtures::{Checkerboard, Dust, NoiseField, OctantFractal, WireLattice};
 use voxel_core::{Resolution, SchoolBBuffer, SparseTree};
 use voxel_gpu::{GpuCamera, GpuContext, GpuRenderer};
 use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+use camera::{FlyCamera, orbit_camera, orbit_eye_forward};
+use hud::{Hud, HudBuilder};
+use input::Input;
 
 #[derive(Parser, Clone, Copy)]
 #[command(
@@ -71,6 +87,43 @@ enum Fixture {
     WireLattice,
     /// Sparse hashed noise — warp-divergence stress.
     Dust,
+    /// Perlin fBm isosurface — smooth organic clouds/caves.
+    Perlin,
+    /// Domain-warped ridged multifractal — interconnected veins/caverns.
+    Caves,
+}
+
+impl Fixture {
+    /// Short upper-case label for the HUD.
+    fn label(self) -> &'static str {
+        match self {
+            Fixture::Sierpinski => "SIERPINSKI",
+            Fixture::Cantor => "CANTOR",
+            Fixture::Checkerboard => "CHECKERBOARD",
+            Fixture::WireLattice => "WIRE-LATTICE",
+            Fixture::Dust => "DUST",
+            Fixture::Perlin => "PERLIN",
+            Fixture::Caves => "CAVES",
+        }
+    }
+}
+
+/// Which camera is driving the view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CamMode {
+    /// Deterministic turntable (default; used by scripted profiling).
+    Orbit,
+    /// Interactive free-fly camera.
+    Free,
+}
+
+impl CamMode {
+    fn label(self) -> &'static str {
+        match self {
+            CamMode::Orbit => "ORBIT",
+            CamMode::Free => "FREE",
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -107,6 +160,9 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => viewer.resize(size.width.max(1), size.height.max(1)),
+            WindowEvent::KeyboardInput { event, .. } => viewer.on_key(&event, event_loop),
+            WindowEvent::MouseInput { state, button, .. } => viewer.on_mouse_button(state, button),
+            WindowEvent::MouseWheel { delta, .. } => viewer.on_scroll(delta),
             WindowEvent::RedrawRequested => {
                 viewer.render();
                 if viewer.done() {
@@ -118,19 +174,21 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let (Some(viewer), DeviceEvent::MouseMotion { delta }) = (self.state.as_mut(), event) {
+            if viewer.mouse_look {
+                viewer.input.look_dx += delta.0 as f32;
+                viewer.input.look_dy += delta.1 as f32;
+            }
+        }
+    }
 }
 
-/// Rolling per-frame timing, reported every `REPORT_EVERY` frames.
-#[derive(Default)]
-struct Profile {
-    frames: u32,
-    encode: f64,
-    gpu: f64,
-    present: f64,
-    total: f64,
-}
-
-const REPORT_EVERY: u32 = 120;
+/// Frame-time samples kept for the HUD sparkline and min/avg/max.
+const HISTORY_CAP: usize = 120;
+/// Target frame budget (60 Hz) used to tint sparkline spikes.
+const BUDGET_MS: f32 = 1000.0 / 60.0;
 
 struct Viewer {
     window: Arc<Window>,
@@ -143,9 +201,24 @@ struct Viewer {
     blit_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     blit_bind: wgpu::BindGroup,
+    hud: Hud,
+    show_hud: bool,
     resolution: Resolution,
+    fixture: Fixture,
+    node_count: usize,
+    leaf_count: usize,
+    // Camera state.
+    mode: CamMode,
+    fly: FlyCamera,
+    input: Input,
+    mouse_look: bool,
     angle: f32,
-    profile: Profile,
+    // Timing.
+    last_instant: Instant,
+    history: Vec<f32>,
+    kernel_ms: f64,
+    encode_ms: f64,
+    present_ms: f64,
     max_frames: u32,
     frames_total: u32,
 }
@@ -173,9 +246,15 @@ impl Viewer {
             max_buffer_size: adapter_limits.max_buffer_size,
             ..wgpu::Limits::default()
         };
+        // Request timestamp queries when available so the HUD can show the true
+        // traverse+shade kernel time (readback-free); harmless if unsupported.
+        let mut features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("viewer device"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -202,35 +281,22 @@ impl Viewer {
         };
         surface.configure(&device, &config);
 
-        // Build + upload the structure (timed; the scan is parallel in core).
+        // Build + upload the structure (the occupancy scan is parallel in core).
         let resolution = Resolution::new(args.res)?;
         eprintln!("building {}³ structure…", resolution.voxels_per_axis());
-        let t = Instant::now();
-        let tree = match args.fixture {
-            Fixture::Sierpinski => {
-                SparseTree::build(&OctantFractal::sierpinski_tetrahedron(resolution))
-            }
-            Fixture::Cantor => SparseTree::build(&OctantFractal::cantor_dust(resolution)),
-            Fixture::Checkerboard => SparseTree::build(&Checkerboard { resolution }),
-            Fixture::WireLattice => SparseTree::build(&WireLattice::new(resolution)),
-            Fixture::Dust => SparseTree::build(&Dust::new(resolution)),
-        };
-        let structure = SchoolBBuffer::from_sparse(&tree);
-        eprintln!(
-            "built {}³: {} nodes, {} leaves in {:.2?}",
-            resolution.voxels_per_axis(),
-            tree.node_count(),
-            tree.leaf_count(),
-            t.elapsed(),
-        );
+        let (structure, node_count, leaf_count) = build_structure(resolution, args.fixture);
 
         let ctx = GpuContext { device, queue };
         let renderer = GpuRenderer::new(&ctx, &structure)?;
 
-        // Blit pipeline + the intermediate render-output texture.
+        // Blit pipeline + the intermediate render-output texture + the HUD.
         let (blit_pipeline, blit_layout, sampler) = build_blit(&ctx.device, format);
         let output_view = make_output(&ctx.device, config.width, config.height);
         let blit_bind = make_blit_bind(&ctx.device, &blit_layout, &output_view, &sampler);
+        let hud = Hud::new(&ctx.device, &ctx.queue, format);
+
+        let n = resolution.voxels_per_axis() as f32;
+        let (eye, fwd) = orbit_eye_forward(0.0, n);
 
         window.request_redraw();
         Ok(Self {
@@ -244,9 +310,22 @@ impl Viewer {
             blit_layout,
             sampler,
             blit_bind,
+            hud,
+            show_hud: true,
             resolution,
+            fixture: args.fixture,
+            node_count,
+            leaf_count,
+            mode: CamMode::Orbit,
+            fly: FlyCamera::from_eye_forward(eye, fwd, n),
+            input: Input::default(),
+            mouse_look: false,
             angle: 0.0,
-            profile: Profile::default(),
+            last_instant: Instant::now(),
+            history: Vec::with_capacity(HISTORY_CAP),
+            kernel_ms: 0.0,
+            encode_ms: 0.0,
+            present_ms: 0.0,
             max_frames: args.frames,
             frames_total: 0,
         })
@@ -270,12 +349,108 @@ impl Viewer {
         );
     }
 
+    /// Switches to the free camera if currently orbiting, seeding it from the
+    /// orbit pose so the view does not jump.
+    fn ensure_free(&mut self) {
+        if self.mode == CamMode::Orbit {
+            let n = self.resolution.voxels_per_axis() as f32;
+            let (eye, fwd) = orbit_eye_forward(self.angle, n);
+            self.fly = FlyCamera::from_eye_forward(eye, fwd, n);
+            self.mode = CamMode::Free;
+        }
+    }
+
+    fn on_key(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+        let pressed = event.state == ElementState::Pressed;
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        // Movement keys hand control to the free camera on press; other keys do
+        // not. `is_movement` is set false in the non-movement arms.
+        let mut is_movement = true;
+        match code {
+            KeyCode::KeyW => self.input.forward = pressed,
+            KeyCode::KeyS => self.input.back = pressed,
+            KeyCode::KeyA => self.input.left = pressed,
+            KeyCode::KeyD => self.input.right = pressed,
+            KeyCode::KeyE | KeyCode::Space => self.input.up = pressed,
+            KeyCode::KeyQ | KeyCode::ControlLeft => self.input.down = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                self.input.boost = pressed;
+                is_movement = false;
+            }
+            KeyCode::Tab if pressed => {
+                self.toggle_mode();
+                is_movement = false;
+            }
+            KeyCode::KeyH if pressed => {
+                self.show_hud = !self.show_hud;
+                is_movement = false;
+            }
+            KeyCode::Escape if pressed => {
+                event_loop.exit();
+                is_movement = false;
+            }
+            _ => is_movement = false,
+        }
+        if is_movement && pressed {
+            self.ensure_free();
+        }
+    }
+
+    fn toggle_mode(&mut self) {
+        match self.mode {
+            CamMode::Orbit => self.ensure_free(),
+            CamMode::Free => self.mode = CamMode::Orbit,
+        }
+    }
+
+    fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if button == MouseButton::Left {
+            self.mouse_look = state == ElementState::Pressed;
+            if self.mouse_look {
+                self.ensure_free();
+            }
+        }
+    }
+
+    fn on_scroll(&mut self, delta: MouseScrollDelta) {
+        let notches = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(p) => p.y as f32 / 120.0,
+        };
+        if self.mode == CamMode::Free {
+            self.input.scroll += notches;
+        }
+    }
+
+    /// Advances the active camera by `dt` and returns its GPU uniform.
+    fn update_camera(&mut self, dt: f32, w: u32, h: u32) -> GpuCamera {
+        let n = self.resolution.voxels_per_axis() as f32;
+        let k = self.resolution.internal_levels();
+        match self.mode {
+            CamMode::Orbit => {
+                // Fixed per-frame increment keeps scripted --frames runs
+                // reproducible regardless of frame rate.
+                self.angle += 0.01;
+                orbit_camera(self.angle, n, w, h, k)
+            }
+            CamMode::Free => {
+                self.fly.apply(dt, &self.input);
+                self.fly.to_gpu(w, h, n, k)
+            }
+        }
+    }
+
     fn render(&mut self) {
         let (w, h) = (self.config.width, self.config.height);
-        self.angle += 0.01;
+        let now = Instant::now();
+        let dt = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+
+        let camera = self.update_camera(dt, w, h);
 
         let t0 = Instant::now();
-        let camera = self.camera(w, h);
         let (Success(frame) | Suboptimal(frame)) = self.surface.get_current_texture() else {
             self.surface.configure(&self.ctx.device, &self.config);
             return;
@@ -284,16 +459,22 @@ impl Viewer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Build the HUD for this frame before recording the pass.
+        if self.show_hud {
+            let builder = self.build_hud(&camera, w);
+            self.hud.prepare(&self.ctx.queue, w, h, &builder);
+        }
+
         let mut encoder = self
             .ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        // Compute: traverse + shade → output texture.
+        // Compute: traverse + shade → output texture (timed when supported).
         self.renderer
-            .render(&mut encoder, &camera, &self.output_view, w, h);
-        // Blit: output texture → surface.
+            .render_timed(&mut encoder, &camera, &self.output_view, w, h);
+        // Blit the image, then draw the HUD over it, in one render pass.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit pass"),
@@ -314,80 +495,183 @@ impl Viewer {
             pass.set_pipeline(&self.blit_pipeline);
             pass.set_bind_group(0, &self.blit_bind, &[]);
             pass.draw(0..3, 0..1);
+            if self.show_hud {
+                self.hud.draw(&mut pass);
+            }
         }
         let t_encode = t0.elapsed();
 
         self.ctx.queue.submit([encoder.finish()]);
-        let gpu_start = Instant::now();
+        // Wait for the GPU so the kernel timestamps and present are ready.
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        let t_gpu = gpu_start.elapsed();
+
+        // Read the GPU-timeline kernel time (None without timestamp support).
+        if let Ok(Some(ns)) = self.renderer.last_kernel_ns() {
+            self.kernel_ms = ns / 1.0e6;
+        }
 
         let present_start = Instant::now();
         frame.present();
         let t_present = present_start.elapsed();
 
-        self.record(w, h, t_encode, t_gpu, t_present, t0.elapsed());
-    }
-
-    fn record(
-        &mut self,
-        w: u32,
-        h: u32,
-        encode: std::time::Duration,
-        gpu: std::time::Duration,
-        present: std::time::Duration,
-        total: std::time::Duration,
-    ) {
+        // Per-frame stats feed the on-screen HUD; the terminal stays quiet.
+        self.encode_ms = t_encode.as_secs_f64() * 1000.0;
+        self.present_ms = t_present.as_secs_f64() * 1000.0;
+        self.push_history(t0.elapsed().as_secs_f32() * 1000.0);
         self.frames_total = self.frames_total.saturating_add(1);
-        let p = &mut self.profile;
-        p.frames += 1;
-        p.encode += encode.as_secs_f64();
-        p.gpu += gpu.as_secs_f64();
-        p.present += present.as_secs_f64();
-        p.total += total.as_secs_f64();
-        if p.frames >= REPORT_EVERY {
-            let f = f64::from(p.frames);
-            eprintln!(
-                "{n}³ {w}x{h} {kr}k px | {ms:.2} ms/frame ({fps:.0} fps) | \
-                 encode {en:.2} · gpu(traverse+shade+blit) {gp:.2} · present {pr:.2} ms",
-                n = self.resolution.voxels_per_axis(),
-                kr = (w * h) / 1000,
-                ms = p.total / f * 1000.0,
-                fps = f / p.total,
-                en = p.encode / f * 1000.0,
-                gp = p.gpu / f * 1000.0,
-                pr = p.present / f * 1000.0,
-            );
-            self.profile = Profile::default();
-        }
+        self.input.end_frame();
     }
 
-    /// The orbiting camera as a [`GpuCamera`] uniform.
-    fn camera(&self, w: u32, h: u32) -> GpuCamera {
-        let nf = self.resolution.voxels_per_axis() as f32;
-        let centre = Vec3::splat(nf * 0.5);
-        let radius = nf * 1.6;
-        let eye = centre
-            + Vec3::new(
-                self.angle.cos() * radius,
-                nf * 0.35,
-                self.angle.sin() * radius,
-            );
-        let forward = (centre - eye).normalize();
-        let right = forward.cross(Vec3::Y).normalize();
-        let up = right.cross(forward);
-        GpuCamera {
-            eye: eye.to_array(),
-            tan: (60f32.to_radians() * 0.5).tan(),
-            forward: forward.to_array(),
-            aspect: w as f32 / h as f32,
-            right: right.to_array(),
-            n: nf,
-            up: up.to_array(),
-            pad: 0.0,
-            dims: [w, h, self.resolution.internal_levels(), 0],
+    /// Appends a frame time to the bounded history ring.
+    fn push_history(&mut self, ms: f32) {
+        if self.history.len() >= HISTORY_CAP {
+            self.history.remove(0);
         }
+        self.history.push(ms);
     }
+
+    /// Assembles the HUD quads for this frame: a padded info panel (accent
+    /// header, stats, a dimmed controls section) plus a frame-time sparkline.
+    fn build_hud(&self, camera: &GpuCamera, w: u32) -> HudBuilder {
+        const HEADER: [f32; 4] = [1.0, 0.82, 0.45, 1.0]; // warm accent
+        const STAT: [f32; 4] = [0.86, 0.92, 1.0, 1.0]; // bright
+        const CTRL: [f32; 4] = [0.55, 0.63, 0.75, 1.0]; // dimmed
+        const PANEL: [f32; 4] = [0.02, 0.03, 0.06, 0.66];
+
+        let mut b = HudBuilder::new(2.0);
+        let lh = b.line_height();
+        let margin = 14.0; // panel inset from the window corner
+        let pad = 14.0; // inner padding
+        let gap = lh * 0.5; // breathing room between sections
+        let spark_h = 46.0;
+
+        let eye = Vec3::from_array(camera.eye);
+        let dir = Vec3::from_array(camera.forward);
+        let (mn, avg, mx) = history_stats(&self.history);
+        let fps = if avg > 0.0 { 1000.0 / avg } else { 0.0 };
+        let kernel = if self.renderer.supports_timing() {
+            format!("KERNEL {:>6.2} MS", self.kernel_ms)
+        } else {
+            "KERNEL     N/A".to_string()
+        };
+
+        let header = format!(
+            "{} {}^3",
+            self.fixture.label(),
+            self.resolution.voxels_per_axis()
+        );
+        let stats = [
+            format!("FPS {fps:>4.0}     {avg:>6.2} MS"),
+            kernel,
+            format!(
+                "ENC {:>5.2}   PRES {:>5.2} MS",
+                self.encode_ms, self.present_ms
+            ),
+            format!("MIN {mn:>5.2}   MAX {mx:>5.2} MS"),
+            format!(
+                "NODES {}   LEAVES {}",
+                compact_count(self.node_count),
+                compact_count(self.leaf_count)
+            ),
+            format!("EYE {:>6.0} {:>6.0} {:>6.0}", eye.x, eye.y, eye.z),
+            format!("DIR {:>+6.2} {:>+6.2} {:>+6.2}", dir.x, dir.y, dir.z),
+            format!("MODE {}     SPD {:>4.0}", self.mode.label(), self.fly.speed),
+        ];
+        let controls = [
+            "WASD QE  MOVE",
+            "DRAG  LOOK",
+            "SCROLL  SPEED",
+            "TAB MODE    H HUD",
+        ];
+
+        // Size the panel to its widest line so nothing overflows; clamp to window.
+        let content_w = std::iter::once(b.text_width(&header))
+            .chain(stats.iter().map(|l| b.text_width(l)))
+            .chain(controls.iter().map(|l| b.text_width(l)))
+            .fold(0.0_f32, f32::max);
+        let panel_w = (content_w + pad * 2.0).min(w as f32 - margin * 2.0);
+
+        let n_text = 1 + stats.len() + controls.len();
+        let panel_h = pad * 2.0 + n_text as f32 * lh + gap * 2.0 + spark_h;
+        b.solid(margin, margin, panel_w, panel_h, PANEL);
+
+        let x = margin + pad;
+        let mut y = margin + pad;
+        b.text(x, y, &header, HEADER);
+        y += lh;
+        for line in &stats {
+            b.text(x, y, line, STAT);
+            y += lh;
+        }
+        y += gap;
+        for line in &controls {
+            b.text(x, y, line, CTRL);
+            y += lh;
+        }
+        y += gap;
+        let spark_max = mx.max(BUDGET_MS) * 1.1;
+        b.sparkline(
+            [x, y, panel_w - pad * 2.0, spark_h],
+            &self.history,
+            spark_max,
+            BUDGET_MS,
+        );
+        b
+    }
+}
+
+/// Builds and uploads the sparse structure for the chosen fixture, returning it
+/// with its node and leaf counts.
+fn build_structure(resolution: Resolution, fixture: Fixture) -> (SchoolBBuffer, usize, usize) {
+    let t = Instant::now();
+    let tree = match fixture {
+        Fixture::Sierpinski => {
+            SparseTree::build(&OctantFractal::sierpinski_tetrahedron(resolution))
+        }
+        Fixture::Cantor => SparseTree::build(&OctantFractal::cantor_dust(resolution)),
+        Fixture::Checkerboard => SparseTree::build(&Checkerboard { resolution }),
+        Fixture::WireLattice => SparseTree::build(&WireLattice::new(resolution)),
+        Fixture::Dust => SparseTree::build(&Dust::new(resolution)),
+        Fixture::Perlin => SparseTree::build(&NoiseField::perlin(resolution)),
+        Fixture::Caves => SparseTree::build(&NoiseField::caves(resolution)),
+    };
+    let structure = SchoolBBuffer::from_sparse(&tree);
+    let (node_count, leaf_count) = (tree.node_count(), tree.leaf_count());
+    eprintln!(
+        "built {}³: {node_count} nodes, {leaf_count} leaves in {:.2?}",
+        resolution.voxels_per_axis(),
+        t.elapsed(),
+    );
+    (structure, node_count, leaf_count)
+}
+
+/// Formats a count compactly for the HUD (`5585909` → `5.59M`, `142078` →
+/// `142.1K`), keeping node/leaf lines short.
+fn compact_count(n: usize) -> String {
+    let f = n as f64;
+    if f >= 1.0e6 {
+        format!("{:.2}M", f / 1.0e6)
+    } else if f >= 1.0e3 {
+        format!("{:.1}K", f / 1.0e3)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Min, mean, and max of a frame-time history (all `0.0` when empty).
+fn history_stats(h: &[f32]) -> (f32, f32, f32) {
+    if h.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut sum = 0.0;
+    for &v in h {
+        mn = mn.min(v);
+        mx = mx.max(v);
+        sum += v;
+    }
+    (mn, sum / h.len() as f32, mx)
 }
 
 /// Builds the fullscreen-blit render pipeline, its bind-group layout, and a

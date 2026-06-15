@@ -35,6 +35,11 @@ pub struct SchoolBBuffer {
     /// One packed [`LeafBounds`] per leaf (same index as `leaves`), precomputed
     /// for the per-brick early-skip and uploaded as the GPU `leaf_bounds` buffer.
     leaf_bounds: Vec<u32>,
+    /// The source tree's [`topology_generation`](SparseTree::topology_generation)
+    /// at `from_sparse` time. [`patch_leaf`](Self::patch_leaf) asserts the tree
+    /// still matches it, so an in-place patch after a topology edit (which would
+    /// silently write to the wrong leaf) panics instead of corrupting the buffer.
+    source_gen: u64,
 }
 
 /// Emits the children block of the node already placed at `nodes[pos]`, then
@@ -55,7 +60,7 @@ fn emit_subtree(
     let children = tree.level_nodes(level - 1);
     let n_children = node.mask().count_ones();
     let block_start =
-        u32::try_from(nodes.len()).expect("School-B node buffer exceeds u32 (resolution ≫ 2048³)");
+        u32::try_from(nodes.len()).expect("School-B node buffer length exceeds u32::MAX");
 
     // Phase 1: push the children contiguously (subtree_base patched in phase 2).
     for j in 0..n_children {
@@ -93,6 +98,7 @@ impl SchoolBBuffer {
             nodes,
             leaves,
             leaf_bounds,
+            source_gen: tree.topology_generation(),
         }
     }
 
@@ -119,6 +125,44 @@ impl SchoolBBuffer {
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Patches leaf `idx` in place after an in-place edit ([`Edit::Leaf`]),
+    /// copying the leaf's words from `tree` and recomputing its bounds so the
+    /// buffer stays consistent with the edited [`SparseTree`]. Node masks and
+    /// indices are untouched (an in-place edit changes neither), so only this
+    /// leaf's words and bounds need re-uploading to the GPU afterwards.
+    ///
+    /// Reading from `tree` (rather than taking caller-supplied words) makes it
+    /// impossible to patch with stale or mismatched data.
+    ///
+    /// # Panics
+    /// Panics if `tree` has had a [`Edit::Topology`] change since this buffer was
+    /// built (its [`topology_generation`](SparseTree::topology_generation) no
+    /// longer matches): a topology edit renumbers leaf indices, so `idx` would
+    /// address the wrong leaf. After a topology edit, re-run [`from_sparse`].
+    ///
+    /// [`Edit::Leaf`]: crate::Edit::Leaf
+    /// [`Edit::Topology`]: crate::Edit::Topology
+    /// [`from_sparse`]: Self::from_sparse
+    pub fn patch_leaf(&mut self, tree: &SparseTree, idx: u32) {
+        assert_eq!(
+            tree.topology_generation(),
+            self.source_gen,
+            "patch_leaf on a topology-stale buffer (leaf indices have been \
+             renumbered); re-run SchoolBBuffer::from_sparse after a topology edit"
+        );
+        let leaf = &tree.leaves_slice()[idx as usize];
+        let i = idx as usize;
+        self.leaves[i] = *leaf;
+        self.leaf_bounds[i] = leaf.occupied_bounds().pack();
+    }
+
+    /// The leaf brick at `idx` (e.g. to fetch the words to re-upload after a
+    /// [`patch_leaf`](Self::patch_leaf)).
+    #[must_use]
+    pub fn leaf_at(&self, idx: u32) -> &LeafBrick {
+        &self.leaves[idx as usize]
     }
 }
 
@@ -165,7 +209,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{Checkerboard, Empty, OctantFractal, SingleVoxel, Solid};
     use crate::layout::traverse;
-    use crate::{OccupancyField, Ray, VoxelCoord, oracle};
+    use crate::{Edit, OccupancyField, Ray, VoxelCoord, oracle};
     use glam::DVec3;
 
     fn res(n: u32) -> Resolution {
@@ -200,6 +244,55 @@ mod tests {
                 "leaf_bounds[{i}] disagrees with the leaf brick",
             );
         }
+    }
+
+    #[test]
+    fn patch_leaf_matches_a_fresh_build_after_in_place_edit() {
+        // After an in-place edit, patching the one leaf must leave the School-B
+        // buffer byte-identical to a fresh re-serialization of the edited tree.
+        let r = res(32);
+        let mut tree = SparseTree::build(&OctantFractal::sierpinski_tetrahedron(r));
+        let mut b = SchoolBBuffer::from_sparse(&tree);
+
+        // (7,7,7) is in brick (0,0,0) (occupied as leaf 0) but is itself empty
+        // in a Sierpinski tetrahedron, so setting it is an in-place Leaf edit.
+        let c = VoxelCoord::new(7, 7, 7);
+        assert!(!tree.is_occupied(c));
+        let idx = match tree.clone().set_voxel(c, true) {
+            Edit::Leaf(i) => i,
+            other => panic!("expected an in-place Leaf edit, got {other:?}"),
+        };
+
+        tree.set_voxel(c, true);
+        b.patch_leaf(&tree, idx);
+
+        let fresh = SchoolBBuffer::from_sparse(&tree);
+        assert_eq!(
+            b.leaves(),
+            fresh.leaves(),
+            "leaf words diverged after patch"
+        );
+        assert_eq!(
+            b.leaf_bounds_words(),
+            fresh.leaf_bounds_words(),
+            "leaf bounds diverged after patch"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "topology-stale")]
+    fn patch_leaf_panics_on_a_topology_stale_buffer() {
+        // Building a buffer, then a topology edit on the tree (which renumbers
+        // leaf indices), then patching the stale buffer must PANIC rather than
+        // silently write the wrong leaf (the review's MAJOR finding).
+        let r = res(32);
+        let mut tree = SparseTree::build(&OctantFractal::sierpinski_tetrahedron(r));
+        let mut b = SchoolBBuffer::from_sparse(&tree);
+        // Corner voxel is empty in a Sierpinski tetrahedron, so setting it adds a
+        // brick (topology) and bumps the generation.
+        let corner = VoxelCoord::new(r.voxels_per_axis() - 1, 0, 0);
+        assert_eq!(tree.set_voxel(corner, true), Edit::Topology);
+        b.patch_leaf(&tree, 0); // generations now differ → panic
     }
 
     #[test]
