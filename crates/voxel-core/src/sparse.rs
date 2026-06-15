@@ -63,6 +63,41 @@ pub enum Edit {
     Topology,
 }
 
+/// The voxel coordinates inside a solid sphere of `radius` voxels centred on
+/// `center` (Euclidean membership: `dx² + dy² + dz² ≤ radius²`). `radius = 0`
+/// yields just the centre voxel.
+///
+/// Coordinates that would fall below the grid origin are omitted; the upper
+/// bound is left to [`SparseTree::set_voxel`], which treats out-of-bounds as
+/// [`Edit::Unchanged`]. This is pure geometry shared by the viewer's edit brush
+/// and the edit benchmarks, so both stamp the identical voxel set.
+#[must_use]
+pub fn brush_voxels(center: VoxelCoord, radius: u32) -> Vec<VoxelCoord> {
+    let r = i64::from(radius);
+    let r2 = r * r;
+    let mut out = Vec::new();
+    for dz in -r..=r {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy + dz * dz > r2 {
+                    continue;
+                }
+                let (x, y, z) = (
+                    i64::from(center.x) + dx,
+                    i64::from(center.y) + dy,
+                    i64::from(center.z) + dz,
+                );
+                if let (Ok(x), Ok(y), Ok(z)) =
+                    (u32::try_from(x), u32::try_from(y), u32::try_from(z))
+                {
+                    out.push(VoxelCoord::new(x, y, z));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Groups a sorted list of child Morton codes into `4³` parent nodes.
 ///
 /// Returns the parent nodes (each with its child mask and the base index of its
@@ -411,6 +446,35 @@ mod tests {
     #[allow(clippy::cast_precision_loss)]
     fn unit(state: &mut u64) -> f64 {
         (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn brush_voxels_is_a_clamped_sphere() {
+        // radius 0 is the single centre voxel.
+        let c = VoxelCoord::new(10, 10, 10);
+        assert_eq!(brush_voxels(c, 0), vec![c]);
+
+        // Every returned voxel lies within the Euclidean radius, and a sample of
+        // in-range voxels is present (membership is exactly dx²+dy²+dz² ≤ r²).
+        let r = 3u32;
+        let got = brush_voxels(c, r);
+        let r2 = i64::from(r) * i64::from(r);
+        for v in &got {
+            let (dx, dy, dz) = (
+                i64::from(v.x) - 10,
+                i64::from(v.y) - 10,
+                i64::from(v.z) - 10,
+            );
+            assert!(dx * dx + dy * dy + dz * dz <= r2, "{v:?} outside radius");
+        }
+        assert!(got.contains(&VoxelCoord::new(13, 10, 10))); // on the axis, |d|=r
+        assert!(!got.contains(&VoxelCoord::new(13, 13, 10))); // corner, outside
+
+        // Voxels below the origin are dropped; the rest survive for set_voxel to
+        // range-check (it treats out-of-bounds as Edit::Unchanged).
+        let edge = brush_voxels(VoxelCoord::new(0, 0, 0), 2);
+        assert!(edge.iter().all(|v| v.x <= 2 && v.y <= 2 && v.z <= 2));
+        assert!(edge.contains(&VoxelCoord::new(0, 0, 0)));
     }
 
     #[test]

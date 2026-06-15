@@ -65,6 +65,9 @@ pub struct GpuRenderer {
     leaf_buf: wgpu::Buffer,
     bounds_buf: wgpu::Buffer,
     camera_buf: wgpu::Buffer,
+    /// Max storage-buffer binding size, kept so [`reupload`](Self::reupload) can
+    /// rebuild the structure buffers after a topology edit without the context.
+    max_binding: u64,
     timing: Option<RenderTiming>,
 }
 
@@ -74,8 +77,9 @@ impl GpuRenderer {
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
 
+        let max_binding = ctx.max_storage_binding();
         let (node_buf, leaf_buf, bounds_buf) =
-            buffers::upload_structure(&device, structure, ctx.max_storage_binding())?;
+            buffers::upload_structure(&device, structure, max_binding)?;
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
             size: std::mem::size_of::<GpuCamera>() as u64,
@@ -159,8 +163,70 @@ impl GpuRenderer {
             leaf_buf,
             bounds_buf,
             camera_buf,
+            max_binding,
             timing,
         })
+    }
+
+    /// Patches a single leaf onto the GPU after an in-place [`Edit::Leaf`].
+    ///
+    /// `structure` must already have had [`SchoolBBuffer::patch_leaf`] applied
+    /// for `leaf_idx`; this copies that one leaf's 16 occupancy words (64 bytes
+    /// at `leaf_idx * 64`) and its packed bounds word (4 bytes at `leaf_idx * 4`)
+    /// into the resident buffers via `queue.write_buffer`. That is an `O(1)`
+    /// upload flushed by the next queue submission (the next rendered frame),
+    /// instead of rebuilding the whole structure. To force it through
+    /// synchronously — e.g. when timing an edit headlessly — call
+    /// [`flush_and_wait`](Self::flush_and_wait).
+    ///
+    /// [`Edit::Leaf`]: voxel_core::Edit::Leaf
+    pub fn update_leaf(&self, structure: &SchoolBBuffer, leaf_idx: u32) {
+        let words = structure.leaf_at(leaf_idx).words32();
+        self.queue.write_buffer(
+            &self.leaf_buf,
+            u64::from(leaf_idx) * 64,
+            bytemuck::cast_slice(&words),
+        );
+        let bounds = structure.leaf_bounds_words()[leaf_idx as usize];
+        self.queue.write_buffer(
+            &self.bounds_buf,
+            u64::from(leaf_idx) * 4,
+            bytemuck::bytes_of(&bounds),
+        );
+    }
+
+    /// Replaces the resident structure after a topology edit
+    /// ([`Edit::Topology`]), which renumbers leaf indices and invalidates the
+    /// node buffer's `subtree_base` offsets. Rebuilds all three buffers from
+    /// `structure` (a fresh [`SchoolBBuffer::from_sparse`] of the edited tree)
+    /// and swaps them in; the per-frame bind group picks them up on the next
+    /// render.
+    ///
+    /// [`Edit::Topology`]: voxel_core::Edit::Topology
+    pub fn reupload(&mut self, structure: &SchoolBBuffer) -> Result<(), GpuError> {
+        let (node_buf, leaf_buf, bounds_buf) =
+            buffers::upload_structure(&self.device, structure, self.max_binding)?;
+        self.node_buf = node_buf;
+        self.leaf_buf = leaf_buf;
+        self.bounds_buf = bounds_buf;
+        Ok(())
+    }
+
+    /// Forces any staged buffer writes (from [`update_leaf`](Self::update_leaf))
+    /// through to the GPU and blocks until the device is idle. The render loop
+    /// does not need this — the next frame's submit flushes staged writes — but a
+    /// headless caller timing an edit's full round-trip can use it.
+    pub fn flush_and_wait(&self) -> Result<(), GpuError> {
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("flush"),
+            });
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|_| GpuError::Poll)?;
+        Ok(())
     }
 
     /// Whether this renderer can report a GPU-timeline kernel time (i.e. the

@@ -32,7 +32,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use glam::Vec3;
 use voxel_core::fixtures::{Checkerboard, Dust, NoiseField, OctantFractal, WireLattice};
-use voxel_core::{Resolution, SchoolBBuffer, SparseTree};
+use voxel_core::{
+    Edit, Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, brush_voxels, traverse,
+};
 use voxel_gpu::{GpuCamera, GpuContext, GpuRenderer};
 use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
 use winit::application::ApplicationHandler;
@@ -161,6 +163,9 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => viewer.resize(size.width.max(1), size.height.max(1)),
             WindowEvent::KeyboardInput { event, .. } => viewer.on_key(&event, event_loop),
+            WindowEvent::CursorMoved { position, .. } => {
+                viewer.cursor = (position.x as f32, position.y as f32);
+            }
             WindowEvent::MouseInput { state, button, .. } => viewer.on_mouse_button(state, button),
             WindowEvent::MouseWheel { delta, .. } => viewer.on_scroll(delta),
             WindowEvent::RedrawRequested => {
@@ -189,7 +194,25 @@ impl ApplicationHandler for App {
 const HISTORY_CAP: usize = 120;
 /// Target frame budget (60 Hz) used to tint sparkline spikes.
 const BUDGET_MS: f32 = 1000.0 / 60.0;
+/// Largest edit-brush radius (voxels); a radius-`r` sphere is `~(2r+1)³` voxels.
+const MAX_BRUSH_RADIUS: u32 = 12;
 
+/// The outcome of the last edit, shown in the HUD: how the brush was applied and
+/// what the incremental GPU sync cost.
+#[derive(Clone, Copy)]
+struct EditFeedback {
+    /// Voxels actually changed (not counting no-ops within the brush).
+    voxels: u32,
+    /// Whether the stroke changed topology (forcing a full re-upload) vs only
+    /// in-place leaf patches.
+    topology: bool,
+    /// Wall-clock of the edit + GPU sync (CPU side), milliseconds.
+    ms: f64,
+}
+
+// Several independent UI toggles (HUD visibility, mouse-look, brush mode, GPU
+// resync flag) — distinct flags, not a state machine, so a struct is right.
+#[allow(clippy::struct_excessive_bools)]
 struct Viewer {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -207,6 +230,20 @@ struct Viewer {
     fixture: Fixture,
     node_count: usize,
     leaf_count: usize,
+    // Editing: the live tree + its School-B buffer, kept CPU-side so an edit can
+    // `set_voxel` the tree, `patch_leaf` the buffer, and sync the GPU (leaf patch
+    // for an in-place edit, full re-upload on topology change).
+    tree: SparseTree,
+    structure: SchoolBBuffer,
+    cursor: (f32, f32),
+    brush_radius: u32,
+    brush_add: bool,
+    last_camera: GpuCamera,
+    last_edit: Option<EditFeedback>,
+    /// Set if a topology re-upload failed: the renderer's buffers are stale, so
+    /// the next edit must do a full re-upload (not an in-place leaf patch into
+    /// wrong-sized buffers) to resync.
+    needs_full_upload: bool,
     // Camera state.
     mode: CamMode,
     fly: FlyCamera,
@@ -224,6 +261,9 @@ struct Viewer {
 }
 
 impl Viewer {
+    // Inherently long: one-shot setup of window, surface, adapter, device,
+    // structure, render pipeline, blit pipeline, and HUD.
+    #[allow(clippy::too_many_lines)]
     fn new(event_loop: &ActiveEventLoop, args: Args) -> Result<Self> {
         let attrs = Window::default_attributes()
             .with_title("voxel-viewer — sparse MIP HDDA on the GPU")
@@ -281,10 +321,12 @@ impl Viewer {
         };
         surface.configure(&device, &config);
 
-        // Build + upload the structure (the occupancy scan is parallel in core).
+        // Build the structure (the occupancy scan is parallel in core). The tree
+        // is kept alongside its buffer so edits can patch both.
         let resolution = Resolution::new(args.res)?;
         eprintln!("building {}³ structure…", resolution.voxels_per_axis());
-        let (structure, node_count, leaf_count) = build_structure(resolution, args.fixture);
+        let (tree, structure) = build_structure(resolution, args.fixture);
+        let (node_count, leaf_count) = (tree.node_count(), tree.leaf_count());
 
         let ctx = GpuContext { device, queue };
         let renderer = GpuRenderer::new(&ctx, &structure)?;
@@ -297,6 +339,13 @@ impl Viewer {
 
         let n = resolution.voxels_per_axis() as f32;
         let (eye, fwd) = orbit_eye_forward(0.0, n);
+        let last_camera = orbit_camera(
+            0.0,
+            n,
+            config.width,
+            config.height,
+            resolution.internal_levels(),
+        );
 
         window.request_redraw();
         Ok(Self {
@@ -316,6 +365,14 @@ impl Viewer {
             fixture: args.fixture,
             node_count,
             leaf_count,
+            tree,
+            structure,
+            cursor: (0.0, 0.0),
+            brush_radius: 3,
+            brush_add: true,
+            last_camera,
+            last_edit: None,
+            needs_full_upload: false,
             mode: CamMode::Orbit,
             fly: FlyCamera::from_eye_forward(eye, fwd, n),
             input: Input::default(),
@@ -347,6 +404,14 @@ impl Viewer {
             &self.output_view,
             &self.sampler,
         );
+        // Keep last_camera (used by edit picks) consistent with the new viewport,
+        // so a click landing before the next frame re-casts with matching dims.
+        let n = self.resolution.voxels_per_axis() as f32;
+        let k = self.resolution.internal_levels();
+        self.last_camera = match self.mode {
+            CamMode::Orbit => orbit_camera(self.angle, n, width, height, k),
+            CamMode::Free => self.fly.to_gpu(width, height, n, k),
+        };
     }
 
     /// Switches to the free camera if currently orbiting, seeding it from the
@@ -387,6 +452,18 @@ impl Viewer {
                 self.show_hud = !self.show_hud;
                 is_movement = false;
             }
+            KeyCode::KeyB if pressed => {
+                self.brush_add = !self.brush_add; // toggle add ↔ remove
+                is_movement = false;
+            }
+            KeyCode::BracketLeft if pressed => {
+                self.brush_radius = self.brush_radius.saturating_sub(1);
+                is_movement = false;
+            }
+            KeyCode::BracketRight if pressed => {
+                self.brush_radius = (self.brush_radius + 1).min(MAX_BRUSH_RADIUS);
+                is_movement = false;
+            }
             KeyCode::Escape if pressed => {
                 event_loop.exit();
                 is_movement = false;
@@ -412,6 +489,10 @@ impl Viewer {
                 self.ensure_free();
             }
         }
+        // Right-click stamps the brush at the cursor (left stays camera-look).
+        if button == MouseButton::Right && state == ElementState::Pressed {
+            self.edit_at_cursor();
+        }
     }
 
     fn on_scroll(&mut self, delta: MouseScrollDelta) {
@@ -421,6 +502,105 @@ impl Viewer {
         };
         if self.mode == CamMode::Free {
             self.input.scroll += notches;
+        }
+    }
+
+    /// Casts a ray from the cursor through the on-screen camera (reproducing the
+    /// render kernel's ray-gen exactly so the edit lands where it is drawn), and
+    /// if it hits a voxel, stamps the current brush there.
+    fn edit_at_cursor(&mut self) {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let cam = self.last_camera;
+        let (px, py) = self.cursor;
+        // Identical to render.wgsl: NDC → camera-basis direction.
+        let ndc_x = ((px + 0.5) / w * 2.0 - 1.0) * cam.tan * cam.aspect;
+        let ndc_y = (1.0 - (py + 0.5) / h * 2.0) * cam.tan;
+        let dir = (Vec3::from_array(cam.forward)
+            + Vec3::from_array(cam.right) * ndc_x
+            + Vec3::from_array(cam.up) * ndc_y)
+            .normalize();
+        let ray = Ray::new(Vec3::from_array(cam.eye).as_dvec3(), dir.as_dvec3());
+        if let Some(hit) = traverse(&self.structure, &ray) {
+            self.apply_brush(hit.voxel);
+        }
+    }
+
+    /// Applies the current brush (add or remove per `brush_add`) centred on
+    /// `center`, then syncs the GPU the cheap way: in-place leaf edits patch only
+    /// the touched leaves (`update_leaf`), and a stroke that changed topology
+    /// rebuilds and re-uploads the structure once. Records timing for the HUD.
+    fn apply_brush(&mut self, center: VoxelCoord) {
+        let t = Instant::now();
+        let mut touched: Vec<u32> = Vec::new();
+        let mut any_topology = false;
+        let mut changed = 0u32;
+        for c in brush_voxels(center, self.brush_radius) {
+            match self.tree.set_voxel(c, self.brush_add) {
+                Edit::Unchanged => {}
+                Edit::Leaf(idx) => {
+                    touched.push(idx);
+                    changed += 1;
+                }
+                Edit::Topology => {
+                    any_topology = true;
+                    changed += 1;
+                }
+            }
+        }
+
+        if changed > 0 {
+            // `structure` is always brought into step with `tree` first (so the
+            // CPU buffer is never topology-stale — `patch_leaf` can't panic);
+            // only the GPU upload may fail, and that is handled below.
+            if any_topology {
+                // Topology renumbers leaf indices and invalidates node offsets:
+                // re-serialize and re-upload the whole structure once.
+                self.structure = SchoolBBuffer::from_sparse(&self.tree);
+                self.sync_renderer_full();
+            } else {
+                // No topology change → indices are stable across the stroke; patch
+                // each touched leaf's words+bounds in the CPU buffer.
+                touched.sort_unstable();
+                touched.dedup();
+                for &idx in &touched {
+                    self.structure.patch_leaf(&self.tree, idx);
+                }
+                if self.needs_full_upload {
+                    // A prior topology re-upload failed, so the renderer's buffers
+                    // are stale/wrong-sized: a full re-upload (carrying these leaf
+                    // patches too) resyncs, rather than patching into bad buffers.
+                    self.sync_renderer_full();
+                } else {
+                    for &idx in &touched {
+                        self.renderer.update_leaf(&self.structure, idx);
+                    }
+                }
+            }
+            self.node_count = self.tree.node_count();
+            self.leaf_count = self.tree.leaf_count();
+        }
+
+        self.last_edit = Some(EditFeedback {
+            voxels: changed,
+            topology: any_topology,
+            ms: t.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    /// Re-uploads the whole structure to the renderer, tracking whether it
+    /// succeeded so a failure (the unreachable-in-practice `BufferTooLarge`)
+    /// leaves the renderer flagged stale and retried on the next edit, never
+    /// patched into mismatched buffers.
+    fn sync_renderer_full(&mut self) {
+        match self.renderer.reupload(&self.structure) {
+            Ok(()) => self.needs_full_upload = false,
+            Err(e) => {
+                eprintln!("edit GPU re-upload failed ({e:?}); retrying on next edit");
+                self.needs_full_upload = true;
+            }
         }
     }
 
@@ -449,6 +629,7 @@ impl Viewer {
         self.last_instant = now;
 
         let camera = self.update_camera(dt, w, h);
+        self.last_camera = camera; // kept so an edit-click can re-cast the on-screen ray
 
         let t0 = Instant::now();
         let (Success(frame) | Suboptimal(frame)) = self.surface.get_current_texture() else {
@@ -554,6 +735,21 @@ impl Viewer {
         } else {
             "KERNEL     N/A".to_string()
         };
+        let brush = format!(
+            "BRUSH {}  R{}",
+            if self.brush_add { "ADD" } else { "REM" },
+            self.brush_radius
+        );
+        let edit = match self.last_edit {
+            Some(e) if e.voxels == 0 => "EDIT  no-op".to_string(),
+            Some(e) => format!(
+                "EDIT {} {:>4}v {:>6.3} MS",
+                if e.topology { "TOPO" } else { "LEAF" },
+                e.voxels,
+                e.ms
+            ),
+            None => "EDIT  —".to_string(),
+        };
 
         let header = format!(
             "{} {}^3",
@@ -576,11 +772,15 @@ impl Viewer {
             format!("EYE {:>6.0} {:>6.0} {:>6.0}", eye.x, eye.y, eye.z),
             format!("DIR {:>+6.2} {:>+6.2} {:>+6.2}", dir.x, dir.y, dir.z),
             format!("MODE {}     SPD {:>4.0}", self.mode.label(), self.fly.speed),
+            brush,
+            edit,
         ];
         let controls = [
             "WASD QE  MOVE",
             "DRAG  LOOK",
             "SCROLL  SPEED",
+            "RCLICK EDIT   B ADD/REM",
+            "[ ] BRUSH RADIUS",
             "TAB MODE    H HUD",
         ];
 
@@ -620,9 +820,9 @@ impl Viewer {
     }
 }
 
-/// Builds and uploads the sparse structure for the chosen fixture, returning it
-/// with its node and leaf counts.
-fn build_structure(resolution: Resolution, fixture: Fixture) -> (SchoolBBuffer, usize, usize) {
+/// Builds the sparse structure for the chosen fixture, returning the live
+/// [`SparseTree`] (kept for editing) and its School-B buffer.
+fn build_structure(resolution: Resolution, fixture: Fixture) -> (SparseTree, SchoolBBuffer) {
     let t = Instant::now();
     let tree = match fixture {
         Fixture::Sierpinski => {
@@ -636,13 +836,14 @@ fn build_structure(resolution: Resolution, fixture: Fixture) -> (SchoolBBuffer, 
         Fixture::Caves => SparseTree::build(&NoiseField::caves(resolution)),
     };
     let structure = SchoolBBuffer::from_sparse(&tree);
-    let (node_count, leaf_count) = (tree.node_count(), tree.leaf_count());
     eprintln!(
-        "built {}³: {node_count} nodes, {leaf_count} leaves in {:.2?}",
+        "built {}³: {} nodes, {} leaves in {:.2?}",
         resolution.voxels_per_axis(),
+        tree.node_count(),
+        tree.leaf_count(),
         t.elapsed(),
     );
-    (structure, node_count, leaf_count)
+    (tree, structure)
 }
 
 /// Formats a count compactly for the HUD (`5585909` → `5.59M`, `142078` →

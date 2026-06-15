@@ -57,4 +57,4 @@ pub use oracle::Hit;
 pub use ray::{Ray, ray_aabb};
 pub use resolution::{Resolution, ResolutionError};
 pub use school_b::SchoolBBuffer;
-pub use sparse::{Edit, SparseTree};
+pub use sparse::{Edit, SparseTree, brush_voxels};

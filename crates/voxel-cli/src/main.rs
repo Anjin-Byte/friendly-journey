@@ -9,9 +9,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use glam::DVec3;
 use voxel_core::fixtures::{Checkerboard, Dust, NoiseField, OctantFractal, Solid, WireLattice};
 use voxel_core::{
-    Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, measure, mirror_traverse,
+    Edit, Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, brush_voxels, measure,
+    mirror_traverse,
 };
-use voxel_gpu::{GpuContext, GpuError, GpuTraverser};
+use voxel_gpu::{GpuContext, GpuError, GpuRenderer, GpuTraverser};
 
 #[derive(Parser)]
 #[command(name = "voxel", about = "Sparse MIP voxel structure — headless tools")]
@@ -109,9 +110,18 @@ struct EditArgs {
     /// Grid resolution per axis (`8·4^k`).
     #[arg(long, default_value_t = 512)]
     res: u32,
-    /// Number of random voxel toggles to time.
+    /// Number of random voxel toggles to time for the per-class costs.
     #[arg(long, default_value_t = 20_000)]
     edits: u32,
+    /// Brush radius (voxels) for the stamp benchmark — a `~(2r+1)³` sphere.
+    #[arg(long, default_value_t = 4)]
+    brush_radius: u32,
+    /// Number of brush stamps to time.
+    #[arg(long, default_value_t = 200)]
+    stamps: u32,
+    /// Also print a compact fixture×resolution sweep (CPU only).
+    #[arg(long)]
+    sweep: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -178,7 +188,234 @@ fn rng_coord(state: &mut u64, n: u32) -> u32 {
     u32::try_from(z % u64::from(n)).unwrap_or(0)
 }
 
-/// Times incremental edits (in-place and topology) against a full rebuild.
+/// Per-class incremental-edit costs.
+///
+/// Topology edits (~µs each) are timed per call; in-place leaf edits — tens of
+/// nanoseconds, at or below the platform timer-resolution floor (~40 ns on
+/// macOS) — are instead timed as one homogeneous batch (`time_leaf_batch`), so
+/// the figure is the real edit cost and not clock quantization.
+struct ClassCosts {
+    /// In-place leaf edit cost (seconds), from the single-timer batch.
+    leaf_s: f64,
+    /// Number of leaf edits actually timed in that batch.
+    leaf_batch: u64,
+    /// Topology edits in the random mix: per-call time (valid, ≫ floor) + count.
+    topo: (std::time::Duration, u64),
+    /// Leaf edits seen in the random mix (for the blended-crossover weighting).
+    leaf_seen: u64,
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn per_edit_s((dur, count): (std::time::Duration, u64)) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        dur.as_secs_f64() / count as f64
+    }
+}
+
+impl ClassCosts {
+    fn mean_topo_s(&self) -> f64 {
+        per_edit_s(self.topo)
+    }
+    /// Blended mean over the random edit mix — leaf cost (from the batch) and
+    /// topology cost (per call), weighted by how often each class occurred. This
+    /// is the figure the incremental-vs-rebuild crossover divides into.
+    #[allow(clippy::cast_precision_loss)]
+    fn mean_s(&self) -> f64 {
+        let n = self.leaf_seen + self.topo.1;
+        if n == 0 {
+            0.0
+        } else {
+            (self.leaf_seen as f64 * self.leaf_s + self.topo.1 as f64 * self.mean_topo_s())
+                / n as f64
+        }
+    }
+}
+
+/// Classifies `edits` random toggles (timing the topology ones per call, which
+/// are ≫ the timer floor) and measures the in-place leaf cost as a homogeneous
+/// batch. Operates on clones, leaving `tree` untouched.
+fn time_class_costs(tree: &SparseTree, n: u32, edits: u32, state: &mut u64) -> ClassCosts {
+    let mut mix = tree.clone();
+    let mut topo = (std::time::Duration::ZERO, 0u64);
+    let mut leaf_seen = 0u64;
+    for _ in 0..edits {
+        let c = VoxelCoord::new(
+            rng_coord(state, n),
+            rng_coord(state, n),
+            rng_coord(state, n),
+        );
+        let occupied = !mix.is_occupied(c);
+        let t = std::time::Instant::now();
+        let kind = mix.set_voxel(c, occupied);
+        let dt = t.elapsed();
+        match kind {
+            Edit::Leaf(_) => leaf_seen += 1,
+            Edit::Topology => {
+                topo.0 += dt;
+                topo.1 += 1;
+            }
+            Edit::Unchanged => {}
+        }
+    }
+    let (leaf_s, leaf_batch) = time_leaf_batch(tree.clone(), n, edits.max(50_000), state);
+    ClassCosts {
+        leaf_s,
+        leaf_batch,
+        topo,
+        leaf_seen,
+    }
+}
+
+/// Single-timer cost of an in-place leaf edit, sampled representatively across
+/// existing bricks: toggle the in-brick neighbour of randomly-sampled occupied
+/// voxels, which always leaves the brick non-empty (so every edit is
+/// [`Edit::Leaf`]). Batch timing keeps the measurement above the per-call timer
+/// floor a single tens-of-nanosecond edit would sink below. Returns
+/// `(seconds per leaf edit, edits timed)`.
+#[allow(clippy::cast_precision_loss)]
+fn time_leaf_batch(mut tree: SparseTree, n: u32, batch: u32, state: &mut u64) -> (f64, u64) {
+    // Untimed: sample occupied voxels to anchor the edits in real bricks.
+    let mut anchors: Vec<VoxelCoord> = Vec::new();
+    let mut tries = 0u32;
+    while anchors.len() < 256 && tries < 100_000 {
+        tries += 1;
+        let c = VoxelCoord::new(
+            rng_coord(state, n),
+            rng_coord(state, n),
+            rng_coord(state, n),
+        );
+        if tree.is_occupied(c) {
+            anchors.push(c);
+        }
+    }
+    if anchors.is_empty() {
+        return (0.0, 0);
+    }
+
+    // Timed: toggle each anchor's in-brick neighbour. Flipping the low x bit stays
+    // in the same brick (`x>>3` unchanged), which the untouched anchor keeps
+    // non-empty, so the edit is always in-place (Edit::Leaf).
+    let len = u32::try_from(anchors.len()).unwrap_or(1);
+    let t = std::time::Instant::now();
+    let mut count = 0u64;
+    for i in 0..batch {
+        let a = anchors[(i % len) as usize];
+        let v = VoxelCoord::new(a.x ^ 1, a.y, a.z);
+        let set = (i / len) % 2 == 0; // alternate so the neighbour really toggles
+        if matches!(tree.set_voxel(v, set), Edit::Leaf(_)) {
+            count += 1;
+        }
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (if count > 0 { secs / count as f64 } else { 0.0 }, count)
+}
+
+/// Aggregate cost of a series of brush stamps — the per-click work the viewer
+/// pays. `total` covers only the `set_voxel` loop (the GPU-sync bookkeeping is
+/// excluded), so it is the pure structural edit cost.
+struct BrushStats {
+    stamps: u32,
+    total: std::time::Duration,
+    voxels_changed: u64,
+    /// Distinct leaves touched, summed over in-place (non-topology) stamps only —
+    /// a stamp that changes topology renumbers leaf indices, so its post-edit
+    /// indices aren't a meaningful distinct-leaf count.
+    leaves_touched: u64,
+    /// In-place stamps contributing to `leaves_touched` (the divisor for it).
+    inplace_stamps: u32,
+    topo_stamps: u32,
+}
+
+/// Times `stamps` add-brushes of `radius` at random centres, mutating `tree`.
+fn time_brush_stamps(
+    mut tree: SparseTree,
+    n: u32,
+    radius: u32,
+    stamps: u32,
+    state: &mut u64,
+) -> BrushStats {
+    let mut s = BrushStats {
+        stamps,
+        total: std::time::Duration::ZERO,
+        voxels_changed: 0,
+        leaves_touched: 0,
+        inplace_stamps: 0,
+        topo_stamps: 0,
+    };
+    for _ in 0..stamps {
+        let center = VoxelCoord::new(
+            rng_coord(state, n),
+            rng_coord(state, n),
+            rng_coord(state, n),
+        );
+        let coords = brush_voxels(center, radius);
+        let t = std::time::Instant::now();
+        let mut changed = 0u64;
+        let mut any_topo = false;
+        let mut leaves: Vec<u32> = Vec::new();
+        for c in coords {
+            match tree.set_voxel(c, true) {
+                Edit::Leaf(idx) => {
+                    changed += 1;
+                    leaves.push(idx);
+                }
+                Edit::Topology => {
+                    changed += 1;
+                    any_topo = true;
+                }
+                Edit::Unchanged => {}
+            }
+        }
+        s.total += t.elapsed();
+        s.voxels_changed += changed;
+        if any_topo {
+            s.topo_stamps += 1;
+        } else {
+            // Indices are stable for an in-place stamp, so the distinct-leaf
+            // count is meaningful; topology stamps renumber and are excluded.
+            leaves.sort_unstable();
+            leaves.dedup();
+            s.leaves_touched += leaves.len() as u64;
+            s.inplace_stamps += 1;
+        }
+    }
+    s
+}
+
+/// Times the GPU sync of an edit on whatever adapter is present: a single
+/// in-place leaf patch (`update_leaf` — CPU staging cost; the transfer is async,
+/// flushed by the next frame's submit) vs a full structure re-upload
+/// (`reupload`, which rebuilds the School-B buffer and recreates the buffers).
+/// Returns `(µs per leaf patch, ms per full re-upload)`.
+fn time_gpu_patch(ctx: &GpuContext, tree: &SparseTree) -> Result<(f64, f64)> {
+    let structure = SchoolBBuffer::from_sparse(tree);
+    let mut renderer = GpuRenderer::new(ctx, &structure)?;
+
+    let patches = 10_000u32;
+    let t = std::time::Instant::now();
+    for _ in 0..patches {
+        renderer.update_leaf(&structure, 0); // re-stage leaf 0's words (O(1))
+    }
+    let leaf_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(patches);
+
+    let reups = 50u32;
+    let t = std::time::Instant::now();
+    for _ in 0..reups {
+        let s = SchoolBBuffer::from_sparse(tree);
+        renderer.reupload(&s)?;
+    }
+    let reup_ms = t.elapsed().as_secs_f64() * 1e3 / f64::from(reups);
+
+    renderer.flush_and_wait()?; // drain staged writes before drop
+    Ok((leaf_us, reup_ms))
+}
+
+/// The edit-performance suite: rebuild baseline, per-class single-edit costs,
+/// the incremental-vs-rebuild crossover, brush-stamp cost, and the GPU sync cost
+/// (leaf patch vs full re-upload). `--sweep` adds a compact fixture×resolution
+/// table.
 #[allow(clippy::cast_precision_loss)]
 fn edit_cmd(args: &EditArgs) {
     let Ok(resolution) = Resolution::new(args.res) else {
@@ -186,54 +423,23 @@ fn edit_cmd(args: &EditArgs) {
         return;
     };
     let n = resolution.voxels_per_axis();
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
 
-    // Baseline: a full build — the O(n³) scan any change costs today.
+    // (1) Full rebuild baseline — the O(n³) scan any change costs today. The
+    // tree stays pristine: every bench below works on a clone or a borrow.
     let t = std::time::Instant::now();
-    let mut tree = build_tree(args.fixture, resolution);
-    let full_build = t.elapsed();
+    let tree = build_tree(args.fixture, resolution);
+    let full_s = t.elapsed().as_secs_f64();
     tracing::info!(
         nodes = tree.node_count(),
         leaves = tree.leaf_count(),
         "structure built"
     );
 
-    // Time random voxel toggles incrementally, split by what each edit did.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut leaf = (std::time::Duration::ZERO, 0u64);
-    let mut topo = (std::time::Duration::ZERO, 0u64);
-    for _ in 0..args.edits {
-        let c = VoxelCoord::new(
-            rng_coord(&mut state, n),
-            rng_coord(&mut state, n),
-            rng_coord(&mut state, n),
-        );
-        let occupied = !tree.is_occupied(c); // always a real change
-        let t = std::time::Instant::now();
-        let kind = tree.set_voxel(c, occupied);
-        let dt = t.elapsed();
-        match kind {
-            voxel_core::Edit::Leaf(_) => {
-                leaf.0 += dt;
-                leaf.1 += 1;
-            }
-            voxel_core::Edit::Topology => {
-                topo.0 += dt;
-                topo.1 += 1;
-            }
-            voxel_core::Edit::Unchanged => {}
-        }
-    }
-
-    let full_s = full_build.as_secs_f64();
-    let per = |d: std::time::Duration, count: u64| {
-        if count == 0 {
-            0.0
-        } else {
-            d.as_secs_f64() / count as f64
-        }
-    };
-    let leaf_s = per(leaf.0, leaf.1);
-    let topo_s = per(topo.0, topo.1);
+    // (2) Per-class single-edit costs (leaf via batch, topology per call).
+    let cc = time_class_costs(&tree, n, args.edits, &mut state);
+    let leaf_s = cc.leaf_s;
+    let topo_s = cc.mean_topo_s();
 
     println!(
         "edit cost — {} {n}³  ({} random toggles)",
@@ -244,25 +450,123 @@ fn edit_cmd(args: &EditArgs) {
         "  full rebuild (scan):            {:>10.2} ms   ← today's cost for ANY change",
         full_s * 1e3
     );
-    if leaf.1 > 0 {
+    if cc.leaf_batch > 0 {
         println!(
             "  in-place edit (Edit::Leaf):     {:>10.3} µs/edit   (N={:>6})  → {:.0}× cheaper",
             leaf_s * 1e6,
-            leaf.1,
+            cc.leaf_batch,
             full_s / leaf_s.max(1e-12),
         );
     }
-    if topo.1 > 0 {
+    if cc.topo.1 > 0 {
         println!(
             "  topology edit (Edit::Topology): {:>10.3} ms/edit   (N={:>6})  → {:.0}× cheaper",
             topo_s * 1e3,
-            topo.1,
+            cc.topo.1,
             full_s / topo_s.max(1e-12),
         );
     }
+
+    // (3) Incremental-vs-rebuild crossover.
+    let mean = cc.mean_s();
+    if mean > 0.0 {
+        println!(
+            "  crossover:                      ≈ {:>8.0} incremental edits = one full rebuild",
+            full_s / mean
+        );
+    }
+
+    // (4) Brush stamp — the per-click cost the viewer pays.
+    let bs = time_brush_stamps(tree.clone(), n, args.brush_radius, args.stamps, &mut state);
+    if bs.stamps > 0 {
+        let per_stamp_ms = bs.total.as_secs_f64() * 1e3 / f64::from(bs.stamps);
+        let vox = bs.voxels_changed as f64 / f64::from(bs.stamps);
+        let leaves = if bs.inplace_stamps > 0 {
+            bs.leaves_touched as f64 / f64::from(bs.inplace_stamps)
+        } else {
+            0.0
+        };
+        let per_vox_us = if bs.voxels_changed > 0 {
+            bs.total.as_secs_f64() * 1e6 / bs.voxels_changed as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  brush stamp (r={}):             {:>10.3} ms/stamp  ({vox:.0} voxels, {per_vox_us:.3} µs/voxel; {leaves:.1} leaves/in-place stamp)",
+            args.brush_radius, per_stamp_ms,
+        );
+        println!(
+            "    {} of {} stamps changed topology (a full re-upload on that click)",
+            bs.topo_stamps, bs.stamps
+        );
+    }
+
+    // (5) GPU sync cost — the renderer's real bottleneck (runtime-gated).
+    if tree.leaf_count() == 0 {
+        println!("  GPU patch cost: empty structure (skipped)");
+    } else if let Ok(ctx) = GpuContext::try_new() {
+        match time_gpu_patch(&ctx, &tree) {
+            Ok((patch_us, reupload_ms)) => {
+                println!(
+                    "  GPU leaf patch (update_leaf):   {patch_us:>10.3} µs/leaf  (CPU staging; transfer async)"
+                );
+                println!(
+                    "  GPU full re-upload (reupload):  {:>10.3} ms        → {:.0}× the leaf patch",
+                    reupload_ms,
+                    reupload_ms * 1e3 / patch_us.max(1e-12),
+                );
+            }
+            Err(e) => eprintln!("GPU patch benchmark failed: {e:?}"),
+        }
+    } else {
+        println!("  GPU patch cost: no adapter (skipped)");
+    }
+
     println!(
-        "  (in-place = O(1) + a one-leaf GPU patch; topology rebuilds node levels\n   O(bricks), scan-free — a batch of edits rebuilds once.)"
+        "  (in-place leaf = O(1) edit + one-leaf GPU patch; topology rebuilds node levels\n   O(bricks), scan-free + a full re-upload. Incremental wins below the crossover count.)"
     );
+
+    if args.sweep {
+        edit_sweep(&mut state);
+    }
+}
+
+/// A compact CPU-only fixture×resolution table of rebuild, per-class, and
+/// crossover costs — the spread across geometry and scale at a glance.
+#[allow(clippy::cast_precision_loss)]
+fn edit_sweep(state: &mut u64) {
+    const FIXTURES: [Fixture; 5] = [
+        Fixture::Sierpinski,
+        Fixture::Dust,
+        Fixture::Caves,
+        Fixture::Checkerboard,
+        Fixture::WireLattice,
+    ];
+    println!("\nfixture×resolution sweep (CPU; 5000 toggles each):");
+    println!(
+        "  {:<13} {:>5}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "fixture", "res", "rebuild", "leaf", "topo", "crossover"
+    );
+    for res in [128u32, 512] {
+        let Ok(resolution) = Resolution::new(res) else {
+            continue;
+        };
+        for f in FIXTURES {
+            let t = std::time::Instant::now();
+            let tree = build_tree(f, resolution);
+            let rebuild_s = t.elapsed().as_secs_f64();
+            let cc = time_class_costs(&tree, resolution.voxels_per_axis(), 5000, state);
+            let mean = cc.mean_s();
+            let crossover = if mean > 0.0 { rebuild_s / mean } else { 0.0 };
+            println!(
+                "  {:<13} {res:>5}  {:>8.2}ms  {:>8.3}µs  {:>8.3}ms  {crossover:>10.0}",
+                fixture_name(f),
+                rebuild_s * 1e3,
+                cc.leaf_s * 1e6,
+                cc.mean_topo_s() * 1e3,
+            );
+        }
+    }
 }
 
 /// Builds the sparse structure for `fixture` at `resolution`.

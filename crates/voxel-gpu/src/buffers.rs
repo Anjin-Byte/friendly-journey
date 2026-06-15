@@ -58,15 +58,20 @@ pub(crate) fn upload_structure(
         contents: &node_bytes,
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // `COPY_DST` on the leaf and bounds buffers so an in-place [`Edit::Leaf`] can
+    // be patched with `queue.write_buffer` (one leaf's 64 words-bytes + 4 bounds-
+    // bytes) instead of rebuilding the whole structure. The node buffer is never
+    // patched in place — a topology edit renumbers indices and recreates all
+    // three — so it stays `STORAGE`-only.
     let leaves = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("leaves"),
         contents: bytemuck::cast_slice(&leaf_words),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let leaf_bounds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("leaf_bounds"),
         contents: bytemuck::cast_slice(&bound_words),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     Ok((nodes, leaves, leaf_bounds))
 }
