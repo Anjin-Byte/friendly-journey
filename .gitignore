@@ -1,5 +1,9 @@
 /target
 **/*.rs.bk
 
+# GPU profiler captures (make trace / programmatic .gputrace).
+*.trace
+*.gputrace
+
 # Symlinked engineering standards vault (see CLAUDE.md / README).
 Engineering_Codex
