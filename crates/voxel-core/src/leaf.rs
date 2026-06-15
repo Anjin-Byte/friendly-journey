@@ -105,13 +105,24 @@ impl LeafBrick {
         self.bits.iter().map(|w| w.count_ones()).sum()
     }
 
-    /// The bounding box of the set voxels (see [`LeafBounds`]). Scans the 512
-    /// bits; computed once at build time, never on the traversal hot path
-    /// (the GPU reads the packed [`LeafBounds::pack`] word instead).
+    /// The bounding box of the set voxels (see [`LeafBounds`]). A dense leaf
+    /// almost always spans the whole brick (so it `FULL`-gates the skip) and
+    /// walks quickly anyway, so a cheap popcount short-circuits it to `FULL`
+    /// without scanning its bits — keeping the build's per-leaf cost bounded
+    /// regardless of occupancy. Only sparse/thin leaves (the skip's targets)
+    /// pay the bit scan. Returning `FULL` early is conservative: it only
+    /// disables the skip for that leaf, never drops a hit. Computed once at
+    /// build time, never on the traversal hot path.
     #[must_use]
     // The word index `w` is `0..8`, so `as u32` never truncates.
     #[allow(clippy::cast_possible_truncation)]
     pub fn occupied_bounds(&self) -> LeafBounds {
+        // Above this many set voxels the box is overwhelmingly the whole brick;
+        // the skip's targets (dust ≤ ~4, wire lines ≤ ~24) are far below it.
+        const BOUNDS_SCAN_LIMIT: u32 = 64;
+        if self.count_occupied() > BOUNDS_SCAN_LIMIT {
+            return LeafBounds::FULL;
+        }
         let mut min = [7u32; 3];
         let mut max = [0u32; 3];
         let mut any = false;

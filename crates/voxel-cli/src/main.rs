@@ -272,10 +272,11 @@ fn bench_cmd(args: &BenchArgs) {
     }
 
     println!(
-        "{:<13} {:>5} {:>9} {:>9} {:>9} {:>5} {:>6} {:>6} {:>7} {:>5} {:>8} {:>8}",
+        "{:<13} {:>5} {:>9} {:>9} {:>9} {:>9} {:>5} {:>6} {:>6} {:>7} {:>5} {:>8} {:>8}",
         "fixture",
         "res",
         "build_ms",
+        "serial_ms",
         "leaves",
         "MiB",
         "D",
@@ -293,10 +294,15 @@ fn bench_cmd(args: &BenchArgs) {
             continue;
         };
         for &fix in &fixtures {
+            // `build_ms` (full n³ scan + Morton sort + OR-reduce) and `serial_ms`
+            // (School-B re-serialize + leaf-bounds) are the per-edit rebuild cost:
+            // any geometry change re-runs both — there is no incremental update.
             let t = std::time::Instant::now();
             let tree = build_tree(fix, resolution);
             let build_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
             let structure = SchoolBBuffer::from_sparse(&tree);
+            let serialize_ms = t.elapsed().as_secs_f64() * 1000.0;
             let report = measure::measure(&tree, 4000);
 
             let rays = camera_rays(resolution, args.rays);
@@ -324,10 +330,11 @@ fn bench_cmd(args: &BenchArgs) {
                 100.0 * report.descent.rays_hit as f64 / report.descent.rays_cast.max(1) as f64;
             let mib = report.total_bytes as f64 / (1u64 << 20) as f64;
             println!(
-                "{:<13} {:>5} {:>9.1} {:>9} {:>9.3} {:>5.2} {:>6.3} {:>6.2} {:>7.1} {:>5.0} {:>8.1} {}",
+                "{:<13} {:>5} {:>9.1} {:>9.1} {:>9} {:>9.3} {:>5.2} {:>6.3} {:>6.2} {:>7.1} {:>5.0} {:>8.1} {}",
                 fixture_name(fix),
                 res,
                 build_ms,
+                serialize_ms,
                 tree.leaf_count(),
                 mib,
                 report.dimension.dimension,
