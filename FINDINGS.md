@@ -1137,6 +1137,8 @@ Adopted as the **sole** traversal kernel (buffer path and viewer alike); the gen
 
 **The refinement.** The win is broad — it nearly doubled even the latency-bound `dust` case (r≈0.1), which is the tell: a meaningful slice of what §5 attributed to "hardware memory latency" was actually this addressable software artifact (local-memory spill of the frame stack), not irreducible cache-miss latency. The orientation **anisotropy ratio** (the ~9× swing, the actual subject of §5) is a separate axis and is expected to persist — but the absolute throughput **floor** was ~1.8× lower than it needed to be, and §5's "nothing to do in software" framing was too strong. Lesson, consistent with the rest of this document: a residual that *correlates* with memory behaviour is not proof that the memory behaviour is *hardware-fixed* — profile the specific mechanism before declaring it intrinsic.
 
+**Verified (re-measured on the register kernel).** Re-running `aniso` at 512³ on the adopted kernel confirms the prediction: the cell-step swing is identical (1.51× / 2.17× / 1.53× for sierpinski / caves / dust), and the **cache/coherence excess is unchanged or slightly larger** (caves 3.08→3.42×, dust 3.39→3.87×) — so the orientation anisotropy is *not* a spill artifact and survives the kernel change. The register win was an orthogonal ~1.8× floor-shift, not a reduction of the swing; the §5 conclusion stands. (One second-order curiosity: `r` moved in opposite directions — caves 0.73→0.47, dust 0.11→0.37 — because the removed per-step spill was step-*correlated* for coherent caves but a step-*decorrelating* memory-pattern noise for incoherent dust, confirming spill and cache-miss latency are distinct mechanisms.)
+
 ---
 
 ## Appendix A — Reproducing the findings
