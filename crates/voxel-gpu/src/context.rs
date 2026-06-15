@@ -39,10 +39,18 @@ impl GpuContext {
             ..wgpu::Limits::default()
         };
 
+        // Enable compute-pass timestamps when the adapter supports them, so the
+        // traverser can time the kernel on the GPU timeline (readback-free). It
+        // is optional — absent it, timed paths fall back to wall-clock.
+        let mut features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxel-gpu device"),
-                required_features: wgpu::Features::empty(),
+                required_features: features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -50,6 +58,14 @@ impl GpuContext {
             }))?;
 
         Ok(Self { device, queue })
+    }
+
+    /// Whether compute-pass timestamp queries are available on this device.
+    #[must_use]
+    pub fn supports_timestamps(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
     }
 
     /// The adapter's per-binding storage-buffer size cap.

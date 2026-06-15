@@ -31,6 +31,10 @@ enum Command {
     /// Sweep fixtures × resolutions and tabulate build, size, §10, and
     /// CPU/GPU traversal throughput — a body of performance data.
     Bench(BenchArgs),
+    /// Sweep view directions and report how traversal cost varies with
+    /// orientation — the algorithmic (cell-step) anisotropy vs the hardware
+    /// (GPU-time) anisotropy, decomposing how much of the swing is addressable.
+    Aniso(AnisoArgs),
 }
 
 #[derive(Args)]
@@ -75,6 +79,25 @@ struct BenchArgs {
     rays: u32,
 }
 
+#[derive(Args)]
+struct AnisoArgs {
+    /// Occupancy fixture to analyze.
+    #[arg(long, value_enum, default_value_t = Fixture::Sierpinski)]
+    fixture: Fixture,
+    /// Grid resolution per axis (`8·4^k`).
+    #[arg(long, default_value_t = 512)]
+    res: u32,
+    /// Number of view directions on the sphere (Fibonacci lattice).
+    #[arg(long, default_value_t = 64)]
+    dirs: usize,
+    /// Orthographic batch is `side²` parallel rays per direction.
+    #[arg(long, default_value_t = 128)]
+    side: u32,
+    /// Print every direction's row, not just the summary.
+    #[arg(long)]
+    verbose: bool,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Fixture {
     /// Sierpinski tetrahedron, `D = 2`.
@@ -117,6 +140,7 @@ fn main() -> Result<()> {
             bench_cmd(&args);
             Ok(())
         }
+        Command::Aniso(args) => aniso_cmd(&args),
     }
 }
 
@@ -368,4 +392,216 @@ fn fixture_name(f: Fixture) -> &'static str {
         Fixture::WireLattice => "wire-lattice",
         Fixture::Dust => "dust",
     }
+}
+
+/// One view direction's algorithmic and hardware cost.
+struct DirSample {
+    dir: DVec3,
+    steps: f64,
+    hit: f64,
+    gpu_ns: f64,
+}
+
+/// Per-direction cost sweep: cell-steps (algorithmic) and, if a GPU is present,
+/// GPU ns/ray for a coherent orthographic batch (hardware).
+fn aniso_collect(args: &AnisoArgs) -> Result<Vec<DirSample>> {
+    let resolution = Resolution::new(args.res)?;
+    let tree = build_tree(args.fixture, resolution);
+    let structure = SchoolBBuffer::from_sparse(&tree);
+    let dirs = measure::fibonacci_dirs(args.dirs.max(1));
+
+    let gpu = GpuContext::try_new().ok();
+    let traverser = if let Some(ctx) = &gpu {
+        eprintln!(
+            "GPU timer: {}",
+            if ctx.supports_timestamps() {
+                "compute-pass timestamps (readback-free kernel time)"
+            } else {
+                "wall-clock (no timestamp support; includes readback)"
+            }
+        );
+        Some(GpuTraverser::new(ctx, &structure)?)
+    } else {
+        eprintln!("(no GPU adapter — hardware-anisotropy column omitted)");
+        None
+    };
+
+    let mut samples = Vec::with_capacity(dirs.len());
+    for &d in &dirs {
+        let stat = measure::directional_steps(&tree, d, args.side);
+        let gpu_ns = gpu_ns_per_ray(traverser.as_ref(), resolution, d, args.side)?;
+        samples.push(DirSample {
+            dir: stat.dir,
+            steps: stat.mean_cell_steps,
+            hit: stat.hit_frac,
+            gpu_ns,
+        });
+    }
+    Ok(samples)
+}
+
+/// Best-of-3 GPU kernel ns/ray for an orthographic batch along `dir`, or `NaN`
+/// with no GPU. Uses compute-pass timestamps when available (readback-free —
+/// the clean kernel time); otherwise falls back to wall-clock.
+#[allow(clippy::cast_precision_loss)]
+fn gpu_ns_per_ray(
+    traverser: Option<&GpuTraverser>,
+    resolution: Resolution,
+    dir: DVec3,
+    side: u32,
+) -> Result<f64> {
+    let Some(t) = traverser else {
+        return Ok(f64::NAN);
+    };
+    let rays = measure::ortho_rays(resolution, dir, side);
+    let _ = t.traverse_timed(&rays)?; // warm
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        let (_, gpu_ns) = t.traverse_timed(&rays)?;
+        let ns = if let Some(ns) = gpu_ns {
+            ns
+        } else {
+            let t0 = std::time::Instant::now();
+            let _ = t.traverse(&rays)?;
+            t0.elapsed().as_secs_f64() * 1e9
+        };
+        best = best.min(ns);
+    }
+    Ok(best / rays.len() as f64)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn aniso_cmd(args: &AnisoArgs) -> Result<()> {
+    let samples = aniso_collect(args)?;
+    let has_gpu = samples.first().is_some_and(|s| s.gpu_ns.is_finite());
+
+    let step_vals: Vec<f64> = samples.iter().map(|s| s.steps).collect();
+    let gpu_vals: Vec<f64> = samples.iter().map(|s| s.gpu_ns).collect();
+    let (step_min, step_max, step_mean) = min_max_mean(&step_vals);
+    let (gpu_min, gpu_max, gpu_mean) = min_max_mean(&gpu_vals);
+    let step_ratio = step_max / step_min.max(1e-9);
+    let gpu_ratio = gpu_max / gpu_min.max(1e-9);
+
+    println!(
+        "anisotropy — {} {}³  ({} directions, {}² rays/dir)",
+        fixture_name(args.fixture),
+        args.res,
+        args.dirs.max(1),
+        args.side,
+    );
+    println!(
+        "  {:<11} {:>8} {:>8} {:>7} {:>8}",
+        "metric", "min", "max", "ratio", "mean"
+    );
+    println!(
+        "  {:<11} {:>8.1} {:>8.1} {:>6.2}× {:>8.1}   algorithmic (DDA + skip)",
+        "cell-steps", step_min, step_max, step_ratio, step_mean,
+    );
+    if has_gpu {
+        println!(
+            "  {:<11} {:>8.1} {:>8.1} {:>6.2}× {:>8.1}   hardware (steps + cache + coherence)",
+            "gpu ns/ray", gpu_min, gpu_max, gpu_ratio, gpu_mean,
+        );
+        println!(
+            "  step↔gpu correlation r = {:.2}   → algorithmic swing {:.2}×, hardware swing {:.2}× \
+             (cache/coherence excess ≈ {:.2}×)",
+            pearson(&step_vals, &gpu_vals),
+            step_ratio,
+            gpu_ratio,
+            gpu_ratio / step_ratio.max(1e-9),
+        );
+        report_extremes(&samples, has_gpu);
+    } else {
+        report_extremes(&samples, has_gpu);
+    }
+
+    if args.verbose {
+        println!(
+            "  {:>22} {:>9} {:>6} {:>10}",
+            "direction", "steps", "hit%", "gpu_ns"
+        );
+        for s in &samples {
+            println!(
+                "  {:>22} {:>9.1} {:>6.0} {:>10.1}",
+                fmt_dir(s.dir),
+                s.steps,
+                s.hit * 100.0,
+                s.gpu_ns,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reports the cheapest and priciest directions (by GPU time if present, else by
+/// cell-steps).
+fn report_extremes(samples: &[DirSample], has_gpu: bool) {
+    let key = |s: &DirSample| if has_gpu { s.gpu_ns } else { s.steps };
+    let cheap = samples
+        .iter()
+        .min_by(|a, b| key(a).total_cmp(&key(b)))
+        .expect("at least one direction");
+    let pricey = samples
+        .iter()
+        .max_by(|a, b| key(a).total_cmp(&key(b)))
+        .expect("at least one direction");
+    println!(
+        "  cheapest {} (steps {:.1}{}); priciest {} (steps {:.1}{})",
+        fmt_dir(cheap.dir),
+        cheap.steps,
+        if has_gpu {
+            format!(", {:.1} ns", cheap.gpu_ns)
+        } else {
+            String::new()
+        },
+        fmt_dir(pricey.dir),
+        pricey.steps,
+        if has_gpu {
+            format!(", {:.1} ns", pricey.gpu_ns)
+        } else {
+            String::new()
+        },
+    );
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn min_max_mean(v: &[f64]) -> (f64, f64, f64) {
+    let finite: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+    (min, max, mean)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn pearson(x: &[f64], y: &[f64]) -> f64 {
+    let pairs: Vec<(f64, f64)> = x
+        .iter()
+        .zip(y)
+        .filter(|(a, b)| a.is_finite() && b.is_finite())
+        .map(|(a, b)| (*a, *b))
+        .collect();
+    let n = pairs.len() as f64;
+    if n < 2.0 {
+        return f64::NAN;
+    }
+    let mx = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+    let (mut cov, mut vx, mut vy) = (0.0, 0.0, 0.0);
+    for (a, b) in &pairs {
+        cov += (a - mx) * (b - my);
+        vx += (a - mx).powi(2);
+        vy += (b - my).powi(2);
+    }
+    if vx == 0.0 || vy == 0.0 {
+        return f64::NAN;
+    }
+    cov / (vx.sqrt() * vy.sqrt())
+}
+
+fn fmt_dir(d: DVec3) -> String {
+    format!("[{:+.2},{:+.2},{:+.2}]", d.x, d.y, d.z)
 }

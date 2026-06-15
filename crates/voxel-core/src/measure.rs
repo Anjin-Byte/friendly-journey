@@ -19,6 +19,7 @@ use std::fmt;
 
 use glam::DVec3;
 
+use crate::Resolution;
 use crate::ray::Ray;
 use crate::sparse::SparseTree;
 
@@ -231,6 +232,95 @@ pub fn descent_stats(tree: &SparseTree, n_rays: u64) -> DescentStats {
     }
 }
 
+/// One view direction's traversal cost in the anisotropy sweep.
+#[derive(Debug, Clone, Copy)]
+pub struct DirStat {
+    /// The unit view direction.
+    pub dir: DVec3,
+    /// Mean DDA cell-steps per ray over the orthographic batch (the algorithmic
+    /// cost from this direction — DDA crossings plus the early-skip).
+    pub mean_cell_steps: f64,
+    /// Maximum cell-steps by any single ray.
+    pub max_cell_steps: u64,
+    /// Fraction of the batch that hit.
+    pub hit_frac: f64,
+}
+
+/// `n` roughly-uniform unit directions on the sphere via the Fibonacci lattice
+/// (deterministic, no clustering at the poles).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn fibonacci_dirs(n: usize) -> Vec<DVec3> {
+    let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    (0..n)
+        .map(|i| {
+            let y = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
+            let r = (1.0 - y * y).max(0.0).sqrt();
+            let theta = golden * i as f64;
+            DVec3::new(r * theta.cos(), y, r * theta.sin())
+        })
+        .collect()
+}
+
+/// An orthographic batch of `side²` parallel rays along `dir`, tiled across the
+/// grid's bounding sphere. Using the bounding sphere (not the projected box)
+/// keeps the ray count and coverage identical from every direction, so the
+/// per-direction costs are directly comparable.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn ortho_rays(resolution: Resolution, dir: DVec3, side: u32) -> Vec<Ray> {
+    let n = f64::from(resolution.voxels_per_axis());
+    let center = DVec3::splat(n * 0.5);
+    let radius = n * 0.5 * 3.0_f64.sqrt();
+    let forward = dir.normalize();
+    // An up vector not parallel to forward, to build the image plane basis.
+    let up_guess = if forward.y.abs() < 0.99 {
+        DVec3::Y
+    } else {
+        DVec3::Z
+    };
+    let right = forward.cross(up_guess).normalize();
+    let up = right.cross(forward);
+    let start = center - forward * (radius * 1.5);
+
+    let mut rays = Vec::with_capacity((side as usize) * (side as usize));
+    for j in 0..side {
+        for i in 0..side {
+            let u = (f64::from(i) + 0.5) / f64::from(side) * 2.0 - 1.0;
+            let v = (f64::from(j) + 0.5) / f64::from(side) * 2.0 - 1.0;
+            let origin = start + right * (u * radius) + up * (v * radius);
+            rays.push(Ray::new(origin, forward));
+        }
+    }
+    rays
+}
+
+/// Mean traversal cost of an orthographic batch cast along `dir` — one sample of
+/// the directional anisotropy profile.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn directional_steps(tree: &SparseTree, dir: DVec3, side: u32) -> DirStat {
+    let rays = ortho_rays(tree.resolution(), dir, side);
+    let mut total = 0u64;
+    let mut max = 0u64;
+    let mut hits = 0u64;
+    for r in &rays {
+        let (hit, s) = tree.traverse_counted(r);
+        total += s.cell_steps;
+        max = max.max(s.cell_steps);
+        if hit.is_some() {
+            hits += 1;
+        }
+    }
+    let denom = rays.len().max(1) as f64;
+    DirStat {
+        dir: dir.normalize(),
+        mean_cell_steps: total as f64 / denom,
+        max_cell_steps: max,
+        hit_frac: hits as f64 / denom,
+    }
+}
+
 /// Runs all three §10 measurements on a built structure.
 #[must_use]
 pub fn measure(tree: &SparseTree, n_rays: u64) -> Report {
@@ -378,6 +468,54 @@ mod tests {
                 "occupancy should grow toward fine levels"
             );
         }
+    }
+
+    #[test]
+    fn fibonacci_dirs_are_unit_and_counted() {
+        let dirs = fibonacci_dirs(128);
+        assert_eq!(dirs.len(), 128);
+        for d in &dirs {
+            assert!((d.length() - 1.0).abs() < 1e-9, "dir not unit: {d:?}");
+        }
+        // Roughly balanced over the sphere: the mean points nowhere in particular.
+        let mean: DVec3 = dirs.iter().copied().sum::<DVec3>() / 128.0;
+        assert!(mean.length() < 0.1, "directions are lopsided: {mean:?}");
+    }
+
+    #[test]
+    fn ortho_rays_are_parallel_and_cover_the_grid() {
+        let r = res(128);
+        let dir = DVec3::new(0.3, 1.0, -0.7);
+        let rays = ortho_rays(r, dir, 32);
+        assert_eq!(rays.len(), 32 * 32);
+        let f = dir.normalize();
+        // All rays share the view direction…
+        for ray in &rays {
+            assert!((ray.dir - f).length() < 1e-12);
+        }
+        // …and enough of them strike a solid grid to count as covering it.
+        let solid = SparseTree::build(&crate::fixtures::Solid { resolution: r });
+        let hits = rays
+            .iter()
+            .filter(|ray| solid.traverse_counted(ray).0.is_some())
+            .count();
+        assert!(hits > rays.len() / 3, "ortho batch barely covered the grid");
+    }
+
+    #[test]
+    fn directional_steps_vary_with_orientation() {
+        // The whole premise: cost depends on view direction. A face-on and a
+        // body-diagonal view of the same structure should not cost the same.
+        let tree = SparseTree::build(&OctantFractal::sierpinski_tetrahedron(res(128)));
+        let axis = directional_steps(&tree, DVec3::X, 48);
+        let diag = directional_steps(&tree, DVec3::new(1.0, 1.0, 1.0), 48);
+        assert!(axis.mean_cell_steps > 0.0 && diag.mean_cell_steps > 0.0);
+        assert!(
+            (axis.mean_cell_steps - diag.mean_cell_steps).abs() > 1e-6,
+            "expected orientation-dependent cost, got {} vs {}",
+            axis.mean_cell_steps,
+            diag.mean_cell_steps
+        );
     }
 
     #[test]

@@ -41,6 +41,16 @@ mod pod {
 }
 use pod::{GpuParams, GpuRay};
 
+/// Reusable compute-pass timestamp resources (present iff the device supports
+/// `TIMESTAMP_QUERY`): a 2-slot query set and the resolve/readback buffers.
+struct Timing {
+    query_set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    /// Nanoseconds per timestamp tick.
+    period: f32,
+}
+
 /// A compiled traversal pipeline with one uploaded structure.
 pub struct GpuTraverser {
     device: wgpu::Device,
@@ -50,6 +60,7 @@ pub struct GpuTraverser {
     node_buf: wgpu::Buffer,
     leaf_buf: wgpu::Buffer,
     bounds_buf: wgpu::Buffer,
+    timing: Option<Timing>,
     n: u32,
     k: u32,
 }
@@ -98,6 +109,32 @@ impl GpuTraverser {
             cache: None,
         });
 
+        let timing = ctx.supports_timestamps().then(|| {
+            let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("hdda timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Timing {
+                query_set,
+                resolve,
+                readback,
+                period: queue.get_timestamp_period(),
+            }
+        });
+
         Ok(Self {
             device,
             queue,
@@ -106,6 +143,7 @@ impl GpuTraverser {
             node_buf,
             leaf_buf,
             bounds_buf,
+            timing,
             n: res.voxels_per_axis(),
             k: res.internal_levels(),
         })
@@ -114,8 +152,30 @@ impl GpuTraverser {
     /// Traverses `rays` on the GPU, returning the first occupied voxel per ray
     /// (`None` for a miss). Order matches `rays`.
     pub fn traverse(&self, rays: &[Ray]) -> Result<Vec<Option<VoxelCoord>>, GpuError> {
+        Ok(self.dispatch(rays, false)?.0)
+    }
+
+    /// Like [`traverse`](Self::traverse), but also returns the kernel's
+    /// GPU-timeline execution time in nanoseconds — measured begin→end of the
+    /// compute pass with timestamp queries, so it excludes buffer setup,
+    /// dispatch latency, and readback. `None` if the device lacks timestamp
+    /// support. This is the clean per-kernel cost for orientation profiling.
+    pub fn traverse_timed(
+        &self,
+        rays: &[Ray],
+    ) -> Result<(Vec<Option<VoxelCoord>>, Option<f64>), GpuError> {
+        self.dispatch(rays, true)
+    }
+
+    /// Encodes and runs one dispatch; when `timed` and timestamps are available,
+    /// brackets the compute pass with timestamp writes and returns the GPU ns.
+    fn dispatch(
+        &self,
+        rays: &[Ray],
+        timed: bool,
+    ) -> Result<(Vec<Option<VoxelCoord>>, Option<f64>), GpuError> {
         if rays.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let ray_count = u32::try_from(rays.len()).expect("ray batch exceeds u32::MAX");
 
@@ -180,6 +240,14 @@ impl GpuTraverser {
             ],
         });
 
+        // Bracket the compute pass with timestamps only when asked and able.
+        let timing = if timed { self.timing.as_ref() } else { None };
+        let timestamp_writes = timing.map(|t| wgpu::ComputePassTimestampWrites {
+            query_set: &t.query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -188,16 +256,47 @@ impl GpuTraverser {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("hdda pass"),
-                timestamp_writes: None,
+                timestamp_writes,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(ray_count.div_ceil(WORKGROUP), 1, 1);
         }
         encoder.copy_buffer_to_buffer(&hits_buf, 0, &readback, 0, hits_bytes);
+        if let Some(t) = timing {
+            encoder.resolve_query_set(&t.query_set, 0..2, &t.resolve, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, 16);
+        }
         self.queue.submit(Some(encoder.finish()));
 
-        self.read_hits(&readback)
+        let hits = self.read_hits(&readback)?;
+        let gpu_ns = match timing {
+            Some(t) => Some(self.read_timestamp(t)?),
+            None => None,
+        };
+        Ok((hits, gpu_ns))
+    }
+
+    /// Maps the resolved timestamp pair and returns the compute-pass duration in
+    /// nanoseconds. Reads bytes unaligned to avoid any `u64` alignment concern.
+    #[allow(clippy::cast_precision_loss)]
+    fn read_timestamp(&self, t: &Timing) -> Result<f64, GpuError> {
+        let slice = t.readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|_| GpuError::Poll)?;
+        rx.recv().map_err(|_| GpuError::Poll)??;
+
+        let data = slice.get_mapped_range();
+        let begin = u64::from_le_bytes(data[0..8].try_into().expect("8 bytes"));
+        let end = u64::from_le_bytes(data[8..16].try_into().expect("8 bytes"));
+        drop(data);
+        t.readback.unmap();
+        Ok(end.saturating_sub(begin) as f64 * f64::from(t.period))
     }
 
     /// Blocks until the dispatch completes, then maps `readback` and decodes the

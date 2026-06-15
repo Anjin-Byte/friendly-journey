@@ -163,6 +163,41 @@ fn gpu_matches_mirror_on_grazing_and_axis_aligned_rays() {
     );
 }
 
+#[test]
+fn traverse_timed_matches_traverse_and_times_the_kernel() {
+    // The timed path must return identical hits to the plain path, and — where
+    // the device supports timestamp queries — a positive, finite kernel time.
+    let Some(ctx) = context_or_skip() else { return };
+    let field = OctantFractal::sierpinski_tetrahedron(res(128));
+    let structure = SchoolBBuffer::from_sparse(&SparseTree::build(&field));
+    let traverser = GpuTraverser::new(&ctx, &structure).unwrap();
+
+    // A full 128² front-face batch, so the kernel clearly spans several
+    // timestamp ticks (a handful of rays can round to a 0-tick pass).
+    let mut rays = Vec::new();
+    for y in 0..128u32 {
+        for x in 0..128u32 {
+            rays.push(Ray::new(
+                DVec3::new(f64::from(x) + 0.5, f64::from(y) + 0.5, -1.0),
+                DVec3::Z,
+            ));
+        }
+    }
+
+    let plain = traverser.traverse(&rays).unwrap();
+    let _ = traverser.traverse_timed(&rays).unwrap(); // warm: prime the query set
+    let (timed, gpu_ns) = traverser.traverse_timed(&rays).unwrap();
+    assert_eq!(plain, timed, "timed and untimed hits must agree");
+
+    if ctx.supports_timestamps() {
+        let ns = gpu_ns.expect("timestamps supported ⇒ Some");
+        assert!(
+            ns > 0.0 && ns.is_finite(),
+            "kernel time should be positive: {ns}"
+        );
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn check_fixture<F: OccupancyField + Sync>(ctx: &GpuContext, field: &F) {
     let structure = SchoolBBuffer::from_sparse(&SparseTree::build(field));
