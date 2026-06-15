@@ -1,0 +1,19 @@
+[package]
+name = "voxel-gpu"
+description = "wgpu adapter for the sparse MIP voxel structure: the stackless HDDA compute kernel over the School-B buffer, behind a runtime adapter probe. Diffed against the voxel-core reference."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+voxel-core = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+pollster = { workspace = true }
+glam = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Guard the "WASM-ready" claim: voxel-core must keep compiling for the browser target.
+targets = ["wasm32-unknown-unknown"]

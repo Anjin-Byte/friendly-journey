@@ -1,0 +1,3 @@
+# `cargo xtask <task>` → runs the build-automation binary in tools/xtask.
+[alias]
+xtask = "run --quiet --package xtask --"

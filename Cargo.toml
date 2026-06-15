@@ -1,0 +1,59 @@
+# Virtual workspace root — orchestrates members, shared deps, lints, and profiles;
+# ships no package of its own (Engineering Codex: Cargo Workspace Configuration).
+[workspace]
+members = ["crates/*", "tools/*"]
+default-members = ["crates/voxel-cli"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+rust-version = "1.87"
+repository = "https://github.com/Anjin-Byte/friendly-journey"
+
+[workspace.dependencies]
+# Internal crates (path deps; the dependency graph runs inward toward voxel-core).
+voxel-core = { path = "crates/voxel-core" }
+voxel-gpu = { path = "crates/voxel-gpu" }
+
+# Shared external deps. Pinned here so members stay uniform; wgpu/winit are
+# version-churny and MUST be pinned centrally (adversarial review R6).
+thiserror = "2"
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.33"
+wgpu = "29"
+winit = "0.30"
+pollster = "0.4"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
+radsort = "0.1"
+
+# Lints are centralized in the root manifest; every member inherits via
+# `[lints] workspace = true` (Engineering Codex: Workspace Lints and Profiles).
+[workspace.lints.rust]
+unsafe_code = "deny"        # Unsafe Quarantine: scoped #[allow] only in audited data-layout modules.
+missing_docs = "warn"       # Documentation as Truth.
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pragmatic allows: noisy-but-not-bug-prone pedantic lints.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"   # error contracts are expressed by the thiserror enums themselves.
+missing_panics_doc = "allow"
+
+# Profiles are only recognized in the root manifest.
+[profile.dev]
+opt-level = 1
+debug = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

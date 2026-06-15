@@ -1,0 +1,19 @@
+[package]
+name = "voxel-core"
+description = "Pure domain core for the sparse MIP voxel structure: domain types, the reference Amanatides-Woo oracle, the School-B builder, the stackless HDDA reference, and the GPU buffer contract. No GPU, no I/O, no windowing."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

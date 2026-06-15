@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+
+# Symlinked engineering standards vault (see CLAUDE.md / README).
+Engineering_Codex

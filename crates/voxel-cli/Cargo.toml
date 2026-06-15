@@ -1,0 +1,24 @@
+[package]
+name = "voxel-cli"
+description = "Headless command-line driver: build the structure, run the §10 measurements, and diff the GPU path against the reference. Zero UI dependencies."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "voxel"
+path = "src/main.rs"
+
+[dependencies]
+voxel-core = { workspace = true }
+voxel-gpu = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+glam = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "voxel-viewer"
+description = "Optional interactive viewer (winit + wgpu surface) that renders ray hits. Holds the only windowing dependency in the workspace; the headless cli never depends on it."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "voxel-viewer"
+path = "src/main.rs"
+
+[dependencies]
+voxel-core = { workspace = true }
+voxel-gpu = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true
