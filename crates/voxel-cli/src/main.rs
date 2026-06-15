@@ -39,6 +39,11 @@ enum Command {
     /// Time incremental voxel edits (in-place vs topology) against a full
     /// rebuild — the cost of dynamic geometry.
     Edit(EditArgs),
+    /// Loop the traversal kernel at its worst orientation as a stable target for
+    /// an external GPU counter capture (Xcode / Instruments) — the measure-first
+    /// step that confirms whether the floor is the cold leaf-miss latency. See
+    /// `CAPTURE.md`.
+    Capture(CaptureArgs),
 }
 
 #[derive(Args)]
@@ -124,6 +129,27 @@ struct EditArgs {
     sweep: bool,
 }
 
+#[derive(Args)]
+struct CaptureArgs {
+    /// Fixture to capture (the cold-miss signal is strongest on sparse `dust`).
+    #[arg(long, value_enum, default_value_t = Fixture::Dust)]
+    fixture: Fixture,
+    /// Grid resolution. Capture both 512 and 2048 — 2048³ (123 MiB) spills L2,
+    /// where cold leaf misses should be maximal.
+    #[arg(long, default_value_t = 512)]
+    res: u32,
+    /// Rays per axis in the orthographic capture batch (`side²` rays/dispatch).
+    #[arg(long, default_value_t = 1024)]
+    side: u32,
+    /// Directions searched to find the worst (most expensive) orientation.
+    #[arg(long, default_value_t = 32)]
+    search_dirs: usize,
+    /// Kernel dispatches to loop — the capture window. Bump it if your profiler
+    /// needs a longer sample; the harness prints the elapsed wall-time.
+    #[arg(long, default_value_t = 1000)]
+    iters: u32,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Fixture {
     /// Sierpinski tetrahedron, `D = 2`.
@@ -175,6 +201,7 @@ fn main() -> Result<()> {
             edit_cmd(&args);
             Ok(())
         }
+        Command::Capture(args) => capture_cmd(&args),
     }
 }
 
@@ -959,6 +986,72 @@ fn aniso_cmd(args: &AnisoArgs) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Loops the GPU traversal kernel at its worst-anisotropy orientation, giving an
+/// external profiler (Xcode GPU capture / Instruments Metal System Trace) a
+/// stable, isolated, repeating workload to read counters from. This is the
+/// measure-first step: confirm the kernel is memory-latency-bound on the cold
+/// `leaf_words` stream before committing engineering to that premise. The
+/// counter checklist and go/no-go thresholds are in `CAPTURE.md`.
+#[allow(clippy::cast_precision_loss)]
+fn capture_cmd(args: &CaptureArgs) -> Result<()> {
+    let resolution = Resolution::new(args.res)?;
+    let tree = build_tree(args.fixture, resolution);
+    let structure = SchoolBBuffer::from_sparse(&tree);
+    let ctx = GpuContext::try_new()
+        .context("the capture harness needs a GPU adapter (this is a GPU-counter target)")?;
+    let traverser = GpuTraverser::new(&ctx, &structure)?;
+
+    // Find the worst (most expensive) orientation — where cold misses peak. A
+    // small search batch keeps the sweep quick; the capture loop uses --side.
+    let search_side = args.side.min(256);
+    eprintln!(
+        "searching {} directions ({}² rays each) for the worst orientation…",
+        args.search_dirs.max(1),
+        search_side,
+    );
+    let mut worst = (DVec3::Z, 0.0f64);
+    for d in measure::fibonacci_dirs(args.search_dirs.max(1)) {
+        let ns = gpu_ns_per_ray(Some(&traverser), resolution, d, search_side)?;
+        if ns.is_finite() && ns > worst.1 {
+            worst = (d, ns);
+        }
+    }
+    let (dir, search_ns) = worst;
+    let rays = measure::ortho_rays(resolution, dir, args.side);
+
+    println!(
+        "capture target — {} {}³",
+        fixture_name(args.fixture),
+        args.res
+    );
+    println!(
+        "  worst orientation {}  (~{:.1} ns/ray at search size; {} rays/dispatch)",
+        fmt_dir(dir),
+        search_ns,
+        rays.len(),
+    );
+    println!(
+        "  looping {} kernel dispatches — attach Xcode GPU capture or Instruments\n  (Metal System Trace) NOW and read counters per CAPTURE.md",
+        args.iters
+    );
+
+    let _ = traverser.traverse(&rays[..rays.len().min(2000)])?; // warm
+    let t = std::time::Instant::now();
+    for _ in 0..args.iters {
+        let _ = traverser.traverse(&rays)?;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    let total = rays.len() as f64 * f64::from(args.iters);
+    println!(
+        "  done: {} dispatches in {:.2}s  ({:.1} Mrays/s, {:.1} ns/ray wall)",
+        args.iters,
+        secs,
+        total / secs / 1e6,
+        secs / total * 1e9,
+    );
     Ok(())
 }
 
