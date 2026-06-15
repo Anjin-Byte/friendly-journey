@@ -1119,6 +1119,26 @@ Taken together, the dead ends are now mapped and — more importantly — *why* 
 
 ---
 
+## 11. Addendum — kernel specialization (register-resident traversal) partially refutes §5
+
+§5 concluded the residual cost was "memory-miss latency — hardware territory, not software." A later experiment (`feat/kernel-specialization`) shows that was **partly wrong**, and the correction is worth ~1.8×.
+
+**The experiment.** The shipped kernel walked the hierarchy through an explicit `array<Frame, 8>` stack, reading the *active* frame as `stack[top]` on every cell-step. A `top` that varies across iterations forces that array into GPU **local memory**, so each step paid a memory access. The variant hoists the active frame into function-local scalars (register-resident) and uses the array only for parent frames, touched on the rarer descend/ascend. This is the WGSL-appropriate form of the inlining the VDB literature gets from C++ template specialization — hot state in registers, no indirection — but it needs no templates or per-`k` codegen and works at every resolution.
+
+**Result (A/B, best-of-12, GPU-timeline timestamps, byte-identical output — 0 / 1,000,000 hits differ, differential 5/5):**
+
+| fixture | 128³ (k=1) | 512³ (k=4) |
+|---|--:|--:|
+| sierpinski | 1.92× | 1.94× |
+| caves | 1.67× | 1.73× |
+| dust | 1.87× | 1.87× |
+
+Adopted as the **sole** traversal kernel (buffer path and viewer alike); the generic stack-indexed form is retired.
+
+**The refinement.** The win is broad — it nearly doubled even the latency-bound `dust` case (r≈0.1), which is the tell: a meaningful slice of what §5 attributed to "hardware memory latency" was actually this addressable software artifact (local-memory spill of the frame stack), not irreducible cache-miss latency. The orientation **anisotropy ratio** (the ~9× swing, the actual subject of §5) is a separate axis and is expected to persist — but the absolute throughput **floor** was ~1.8× lower than it needed to be, and §5's "nothing to do in software" framing was too strong. Lesson, consistent with the rest of this document: a residual that *correlates* with memory behaviour is not proof that the memory behaviour is *hardware-fixed* — profile the specific mechanism before declaring it intrinsic.
+
+---
+
 ## Appendix A — Reproducing the findings
 
 The project is a virtual Cargo workspace; the headless tool is the `voxel` binary, run as `cargo run --release -p voxel-cli -- <subcommand>`. The experiments live on different branches — each branch is a committed diagnostic carrying the subcommand that reproduces its section. **All GPU timings are thermal-sensitive** (Apple M-series via wgpu drifted absolute numbers 2–6× over a session); run from a cool machine and trust *ratios within a single invocation*, not absolute milliseconds across runs. Set `RUST_LOG=warn` to quiet logs.
