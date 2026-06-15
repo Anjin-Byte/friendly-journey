@@ -92,6 +92,77 @@ fn gpu_matches_on_pathological_fixtures() {
     check_fixture(&ctx, &Dust::new(res(128)));
 }
 
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn gpu_matches_mirror_on_grazing_and_axis_aligned_rays() {
+    // The random battery above never aims a ray to graze a single-voxel brick's
+    // occupied-box face or travel exactly axis-aligned — the geometry the
+    // per-brick early-skip's f32 box test is most fragile on. Aim rays straight
+    // at occupied voxels (jittered to graze edges) and exactly down the axes, and
+    // assert the GPU agrees with the f32 mirror EXACTLY (they share the kernel,
+    // so any disagreement is a real bug, not f32-vs-f64 grazing).
+    let Some(ctx) = context_or_skip() else { return };
+    let field = Dust::new(res(128));
+    let structure = SchoolBBuffer::from_sparse(&SparseTree::build(&field));
+    let traverser = GpuTraverser::new(&ctx, &structure).unwrap();
+    let n = field.resolution().voxels_per_axis();
+
+    // Collect occupied voxels to aim at.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut targets = Vec::new();
+    while targets.len() < 40 {
+        let x = u32::try_from(splitmix64(&mut state) % u64::from(n)).unwrap();
+        let y = u32::try_from(splitmix64(&mut state) % u64::from(n)).unwrap();
+        let z = u32::try_from(splitmix64(&mut state) % u64::from(n)).unwrap();
+        if field.is_occupied(VoxelCoord::new(x, y, z)) {
+            targets.push([x, y, z]);
+        }
+    }
+
+    let axes = [
+        DVec3::X,
+        DVec3::Y,
+        DVec3::Z,
+        DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(1.0, 0.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+    ];
+    let mut rays = Vec::new();
+    for t in &targets {
+        let centre = DVec3::new(
+            f64::from(t[0]) + 0.5,
+            f64::from(t[1]) + 0.5,
+            f64::from(t[2]) + 0.5,
+        );
+        for dir in axes {
+            for _ in 0..16 {
+                let aim = centre
+                    + DVec3::new(
+                        unit(&mut state) * 1.6 - 0.8,
+                        unit(&mut state) * 1.6 - 0.8,
+                        unit(&mut state) * 1.6 - 0.8,
+                    );
+                rays.push(Ray::new(aim - dir * 50.0, dir));
+            }
+        }
+    }
+
+    let gpu = traverser.traverse(&rays).unwrap();
+    let mut mismatch = 0u32;
+    for (ray, g) in rays.iter().zip(&gpu) {
+        if *g != mirror_traverse(&structure, ray) {
+            mismatch += 1;
+        }
+    }
+    assert_eq!(
+        mismatch,
+        0,
+        "GPU disagreed with the f32 mirror on {mismatch}/{} grazing/axis-aligned rays",
+        rays.len()
+    );
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn check_fixture<F: OccupancyField + Sync>(ctx: &GpuContext, field: &F) {
     let structure = SchoolBBuffer::from_sparse(&SparseTree::build(field));

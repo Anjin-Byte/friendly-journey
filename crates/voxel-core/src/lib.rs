@@ -46,7 +46,7 @@ mod resolution;
 
 pub use coord::VoxelCoord;
 pub use layout::{Cell, NodeLayout, TraversalStats, traverse};
-pub use leaf::LeafBrick;
+pub use leaf::{LeafBounds, LeafBrick};
 pub use level::Level;
 pub use mip::BrickGrid;
 pub use mirror::mirror_traverse;

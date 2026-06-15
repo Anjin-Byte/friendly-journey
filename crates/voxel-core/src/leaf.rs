@@ -5,6 +5,13 @@
 //! surface (`idea.md` §7.2): an occupied brick is *not* itself a hit, only a
 //! set voxel inside it is. Internally 8 × `u64`; the frozen GPU contract (P3)
 //! is the bit-identical `16 × u32` view.
+//!
+//! Each leaf also carries a packed [`LeafBounds`] (the bounding box of its set
+//! voxels) — a third GPU storage binding (`leaf_bounds`, group 0 binding 2)
+//! alongside the nodes and leaf words. It drives the per-brick early-skip
+//! (`idea.md` §8): a ray whose chord misses this box skips the `8³` walk. The
+//! WGSL kernel unpacks it with the same shift/mask layout as [`LeafBounds::pack`]
+//! (pinned by `wgsl_bit_layout_matches_pack`).
 
 use crate::morton;
 
@@ -13,6 +20,52 @@ use crate::morton;
 pub struct LeafBrick {
     /// 512 bits, `bits[i>>6] & (1 << (i & 63))` for Morton index `i`.
     bits: [u64; 8],
+}
+
+/// The axis-aligned bounding box of a brick's set voxels, in local `0..8`
+/// coordinates (inclusive `min`/`max`). The basis for the per-brick early-skip:
+/// a ray whose chord through the brick misses this box cannot hit any voxel in
+/// it, so the `8³` interior walk is skipped without descending (`idea.md` §8 —
+/// the leaf is the one level that otherwise has no intra-cell acceleration).
+///
+/// Packs into one `u32` (`6 × 3` bits) — the frozen GPU `leaf_bounds` word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeafBounds {
+    /// Inclusive lower corner of the occupied region (each axis `0..8`).
+    pub min: [u32; 3],
+    /// Inclusive upper corner of the occupied region (each axis `0..8`).
+    pub max: [u32; 3],
+}
+
+impl LeafBounds {
+    /// The whole brick — the conservative bound (always descend). Used for an
+    /// empty brick, which never occurs in a built structure but keeps the bound
+    /// safe by construction.
+    pub const FULL: LeafBounds = LeafBounds {
+        min: [0, 0, 0],
+        max: [7, 7, 7],
+    };
+
+    /// Packs the bounds into one `u32`: `min.{x,y,z}` in bits `0,3,6` and
+    /// `max.{x,y,z}` in bits `9,12,15` (each `0..8`).
+    #[must_use]
+    pub const fn pack(self) -> u32 {
+        self.min[0]
+            | (self.min[1] << 3)
+            | (self.min[2] << 6)
+            | (self.max[0] << 9)
+            | (self.max[1] << 12)
+            | (self.max[2] << 15)
+    }
+
+    /// Inverse of [`pack`](Self::pack).
+    #[must_use]
+    pub const fn unpack(p: u32) -> Self {
+        Self {
+            min: [p & 7, (p >> 3) & 7, (p >> 6) & 7],
+            max: [(p >> 9) & 7, (p >> 12) & 7, (p >> 15) & 7],
+        }
+    }
 }
 
 impl LeafBrick {
@@ -50,6 +103,36 @@ impl LeafBrick {
     #[must_use]
     pub fn count_occupied(&self) -> u32 {
         self.bits.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// The bounding box of the set voxels (see [`LeafBounds`]). Scans the 512
+    /// bits; computed once at build time, never on the traversal hot path
+    /// (the GPU reads the packed [`LeafBounds::pack`] word instead).
+    #[must_use]
+    // The word index `w` is `0..8`, so `as u32` never truncates.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn occupied_bounds(&self) -> LeafBounds {
+        let mut min = [7u32; 3];
+        let mut max = [0u32; 3];
+        let mut any = false;
+        for (w, word) in self.bits.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                any = true;
+                let i = (w as u32) * 64 + bits.trailing_zeros();
+                let c = morton::decode(u64::from(i));
+                for (a, v) in [c.x, c.y, c.z].into_iter().enumerate() {
+                    min[a] = min[a].min(v);
+                    max[a] = max[a].max(v);
+                }
+                bits &= bits - 1;
+            }
+        }
+        if any {
+            LeafBounds { min, max }
+        } else {
+            LeafBounds::FULL
+        }
     }
 
     /// The raw words, for building the GPU buffer (P3).
@@ -93,6 +176,63 @@ mod tests {
         assert!(!leaf.get_local(3, 5, 6));
         assert!(!leaf.is_empty());
         assert_eq!(leaf.count_occupied(), 1);
+    }
+
+    #[test]
+    fn occupied_bounds_tighten_to_set_voxels() {
+        let mut leaf = LeafBrick::EMPTY;
+        leaf.set_local(2, 1, 5);
+        leaf.set_local(6, 4, 3);
+        let b = leaf.occupied_bounds();
+        assert_eq!(b.min, [2, 1, 3]);
+        assert_eq!(b.max, [6, 4, 5]);
+        // Round-trips through the packed GPU word.
+        assert_eq!(LeafBounds::unpack(b.pack()), b);
+    }
+
+    #[test]
+    fn single_voxel_bounds_are_a_point() {
+        let mut leaf = LeafBrick::EMPTY;
+        leaf.set_local(7, 0, 4);
+        let b = leaf.occupied_bounds();
+        assert_eq!(b.min, [7, 0, 4]);
+        assert_eq!(b.max, [7, 0, 4]);
+    }
+
+    #[test]
+    fn empty_bounds_are_the_full_brick() {
+        assert_eq!(LeafBrick::EMPTY.occupied_bounds(), LeafBounds::FULL);
+    }
+
+    #[test]
+    fn wgsl_bit_layout_matches_pack() {
+        // Pin the GPU contract: `leaf_reaches` in traversal.wgsl unpacks the
+        // packed word with this exact shift/mask sequence. Replicate it in Rust
+        // and assert it recovers the same min/max as pack/unpack, so the WGSL
+        // and Rust bit layouts cannot silently drift (no adapter needed).
+        for b in [
+            LeafBounds {
+                min: [0, 1, 2],
+                max: [3, 4, 5],
+            },
+            LeafBounds {
+                min: [7, 0, 7],
+                max: [7, 6, 7],
+            },
+            LeafBounds {
+                min: [2, 2, 2],
+                max: [2, 2, 2],
+            },
+            LeafBounds::FULL,
+        ] {
+            let p = b.pack();
+            // The literal traversal.wgsl sequence.
+            let mn = [p & 7, (p >> 3) & 7, (p >> 6) & 7];
+            let mx = [(p >> 9) & 7, (p >> 12) & 7, (p >> 15) & 7];
+            assert_eq!(mn, b.min, "WGSL min unpack drifted");
+            assert_eq!(mx, b.max, "WGSL max unpack drifted");
+            assert_eq!(LeafBounds::unpack(p), b);
+        }
     }
 
     #[test]

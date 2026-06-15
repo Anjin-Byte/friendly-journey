@@ -12,6 +12,8 @@ struct Node {
 
 @group(0) @binding(0) var<storage, read> nodes: array<Node>;
 @group(0) @binding(1) var<storage, read> leaf_words: array<u32>;
+// One packed LeafBounds per leaf (min.xyz in bits 0/3/6, max.xyz in 9/12/15).
+@group(0) @binding(2) var<storage, read> leaf_bounds: array<u32>;
 
 const BIG: f32 = 1e30;
 
@@ -54,6 +56,38 @@ fn leaf_bit(leaf_idx: u32, v: vec3<u32>) -> bool {
     let idx = morton8(v & vec3<u32>(7u));
     let word = leaf_words[leaf_idx * 16u + (idx >> 5u)];
     return ((word >> (idx & 31u)) & 1u) == 1u;
+}
+
+// Per-brick early-skip — the exact f32 algorithm of mirror.rs `leaf_reaches_f32`.
+// Whether the ray can reach leaf `slot`'s occupied sub-box (brick corner
+// `origin`, entered at `t_enter`). `false` ⇒ the 8³ walk is skipped. The box
+// contains every set voxel, so a chord that misses it provably misses the brick.
+fn leaf_reaches(slot: u32, o: vec3<f32>, d: vec3<f32>, origin: vec3<u32>, t_enter: f32) -> bool {
+    let packed = leaf_bounds[slot];
+    let mn = vec3<u32>(packed & 7u, (packed >> 3u) & 7u, (packed >> 6u) & 7u);
+    let mx = vec3<u32>((packed >> 9u) & 7u, (packed >> 12u) & 7u, (packed >> 15u) & 7u);
+    // Full-brick bound ⇒ the test can never skip; descend without it.
+    if (all(mn == vec3<u32>(0u, 0u, 0u)) && all(mx == vec3<u32>(7u, 7u, 7u))) {
+        return true;
+    }
+    // Dilate the occupied box by one voxel (SKIP_MARGIN) so this f32 slab test is
+    // never stricter than the interior DDA — without it, grazing rays on
+    // single-voxel bricks get wrongly skipped (the box interval rounds degenerate).
+    let m = vec3<f32>(1.0, 1.0, 1.0);
+    let lo = vec3<f32>(origin + mn) - m;
+    let hi = vec3<f32>(origin + mx + vec3<u32>(1u)) + m;
+
+    var t_near = -BIG;
+    var t_far = BIG;
+    if (d.x == 0.0) { if (o.x < lo.x || o.x > hi.x) { return false; } }
+    else { let inv = 1.0 / d.x; var a = (lo.x - o.x) * inv; var b = (hi.x - o.x) * inv; if (a > b) { let t = a; a = b; b = t; } t_near = max(t_near, a); t_far = min(t_far, b); }
+    if (d.y == 0.0) { if (o.y < lo.y || o.y > hi.y) { return false; } }
+    else { let inv = 1.0 / d.y; var a = (lo.y - o.y) * inv; var b = (hi.y - o.y) * inv; if (a > b) { let t = a; a = b; b = t; } t_near = max(t_near, a); t_far = min(t_far, b); }
+    if (d.z == 0.0) { if (o.z < lo.z || o.z > hi.z) { return false; } }
+    else { let inv = 1.0 / d.z; var a = (lo.z - o.z) * inv; var b = (hi.z - o.z) * inv; if (a > b) { let t = a; a = b; b = t; } t_near = max(t_near, a); t_far = min(t_far, b); }
+
+    if (t_near > t_far) { return false; }
+    return t_far >= t_enter;
 }
 
 struct Frame {
@@ -212,10 +246,20 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
             let c = stack[top].cell;
             let bit = child_bit(c);
             let node = nodes[stack[top].node];
-            if (has_child(node, bit)) {
-                let size = cell_size_of(stack[top].level);
-                let child_origin = stack[top].origin + c * size;
-                stack[sp] = make_frame(o, d, child_slot(node, bit), stack[top].level - 1u, child_origin, stack[top].t_entry);
+            let child_level = stack[top].level - 1u;
+            let size = cell_size_of(stack[top].level);
+            let child_origin = stack[top].origin + c * size;
+            var descend = has_child(node, bit);
+            var slot = 0u;
+            if (descend) {
+                slot = child_slot(node, bit);
+                // Leaf child: skip the descent if its occupied box is unreachable.
+                if (child_level == 1u) {
+                    descend = leaf_reaches(slot, o, d, child_origin, stack[top].t_entry);
+                }
+            }
+            if (descend) {
+                stack[sp] = make_frame(o, d, slot, child_level, child_origin, stack[top].t_entry);
                 sp = sp + 1u;
             } else {
                 if (!walker_step(&stack[top])) {

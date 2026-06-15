@@ -11,11 +11,27 @@
 use glam::DVec3;
 
 use crate::dda::DdaWalker;
-use crate::leaf::LeafBrick;
+use crate::leaf::{LeafBounds, LeafBrick};
 use crate::node::child_bit;
 use crate::oracle::Hit;
 use crate::ray::{Ray, ray_aabb};
 use crate::{Resolution, VoxelCoord};
+
+/// Conservative slack (in `t`) for the leaf early-skip. Far larger than an `f64`
+/// ULP at any supported `t`, so rounding never lets the skip drop a real hit —
+/// the skip only avoids work, keeping the reference traversal bit-identical to
+/// the un-skipped one (and thus to the oracle).
+const SKIP_EPS: f64 = 1e-9;
+
+/// Voxel-space dilation of the occupied sub-box before the early-skip slab test.
+/// The interior DDA can `floor` a grazing ray into the occupied voxel's cell
+/// even when the *box* slab test (different arithmetic) says the razor-thin
+/// chord misses; a one-voxel halo dwarfs that disagreement, so the skip is never
+/// stricter than the walk it guards. Biasing toward *descend* only ever costs a
+/// few extra interior walks, never a dropped hit. Shared by the `f32` mirror and
+/// the WGSL kernel, where the rounding error is far larger (review found the
+/// `f32` paths dropped up to 5% of grazing hits at 2048³ without this).
+pub(crate) const SKIP_MARGIN: f64 = 1.0;
 
 /// A resolved cell during descent: an internal node, a leaf brick, or absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +61,49 @@ pub trait NodeLayout {
 
     /// The leaf brick at array index `idx`.
     fn leaf(&self, idx: u32) -> &LeafBrick;
+
+    /// The occupied-voxel [`LeafBounds`] of leaf `idx`, for the per-brick
+    /// early-skip. The default scans the brick; layouts that precompute and
+    /// store the packed bounds (the GPU buffer) override this.
+    fn leaf_bounds(&self, idx: u32) -> LeafBounds {
+        self.leaf(idx).occupied_bounds()
+    }
+}
+
+/// Whether `ray`'s chord can reach the occupied sub-box of leaf `idx`, whose
+/// brick lower corner is `origin` (voxel coords) and which the ray enters at
+/// `t_enter`. `false` ⇒ the brick is provably a miss and its `8³` walk is
+/// skipped. Conservative: only returns `false` when the chord cannot intersect
+/// any set voxel (all set voxels lie inside the returned box).
+fn leaf_chord_reaches<L: NodeLayout + ?Sized>(
+    layout: &L,
+    idx: u32,
+    ray: &Ray,
+    origin: [u32; 3],
+    t_enter: f64,
+) -> bool {
+    let b = layout.leaf_bounds(idx);
+    // Full-brick bound ⇒ the box is the cell the ray already entered, so the
+    // test can never skip — descend without paying for the slab test. (Dense
+    // fractals like Sierpinski hit this on every leaf; the skip is for the
+    // sparse/thin bricks whose box is a strict sub-region.)
+    if b == LeafBounds::FULL {
+        return true;
+    }
+    let lo = DVec3::new(
+        f64::from(origin[0] + b.min[0]) - SKIP_MARGIN,
+        f64::from(origin[1] + b.min[1]) - SKIP_MARGIN,
+        f64::from(origin[2] + b.min[2]) - SKIP_MARGIN,
+    );
+    let hi = DVec3::new(
+        f64::from(origin[0] + b.max[0] + 1) + SKIP_MARGIN,
+        f64::from(origin[1] + b.max[1] + 1) + SKIP_MARGIN,
+        f64::from(origin[2] + b.max[2] + 1) + SKIP_MARGIN,
+    );
+    match ray_aabb(ray.origin, ray.dir, lo, hi) {
+        Some((_, t_far)) => t_far >= t_enter - SKIP_EPS,
+        None => false,
+    }
 }
 
 /// Per-ray traversal counters for the §10 measurements (review R5).
@@ -141,16 +200,27 @@ fn walk<L: NodeLayout + ?Sized>(
                         origin[1] + c[1] * child_size,
                         origin[2] + c[2] * child_size,
                     ];
-                    if let Some(hit) = walk(
-                        layout,
-                        ray,
-                        child,
-                        level - 1,
-                        child_origin,
-                        walker.t_entry(),
-                        stats,
-                    ) {
-                        return Some(hit);
+                    // Per-brick early-skip: if the child is a leaf whose
+                    // occupied sub-box the ray's chord misses, treat it as empty
+                    // and keep stepping — no descent, no interior walk.
+                    let descend = match child {
+                        Cell::Leaf(idx) => {
+                            leaf_chord_reaches(layout, idx, ray, child_origin, walker.t_entry())
+                        }
+                        _ => true,
+                    };
+                    if descend {
+                        if let Some(hit) = walk(
+                            layout,
+                            ray,
+                            child,
+                            level - 1,
+                            child_origin,
+                            walker.t_entry(),
+                            stats,
+                        ) {
+                            return Some(hit);
+                        }
                     }
                 }
                 if !walker.step() {

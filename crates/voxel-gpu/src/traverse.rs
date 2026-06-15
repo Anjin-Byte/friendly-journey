@@ -49,6 +49,7 @@ pub struct GpuTraverser {
     bind_layout: wgpu::BindGroupLayout,
     node_buf: wgpu::Buffer,
     leaf_buf: wgpu::Buffer,
+    bounds_buf: wgpu::Buffer,
     n: u32,
     k: u32,
 }
@@ -60,7 +61,7 @@ impl GpuTraverser {
         let queue = ctx.queue.clone();
         let res = structure.resolution();
 
-        let (node_buf, leaf_buf) =
+        let (node_buf, leaf_buf, bounds_buf) =
             buffers::upload_structure(&device, structure, ctx.max_storage_binding())?;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -73,11 +74,12 @@ impl GpuTraverser {
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("hdda layout"),
             entries: &[
-                buffers::storage_entry(0, true),
-                buffers::storage_entry(1, true),
-                buffers::storage_entry(2, true),
-                buffers::uniform_entry(3),
-                buffers::storage_entry(4, false),
+                buffers::storage_entry(0, true),  // nodes
+                buffers::storage_entry(1, true),  // leaf_words
+                buffers::storage_entry(2, true),  // leaf_bounds
+                buffers::storage_entry(3, true),  // rays
+                buffers::uniform_entry(4),        // params
+                buffers::storage_entry(5, false), // hits
             ],
         });
 
@@ -103,6 +105,7 @@ impl GpuTraverser {
             bind_layout,
             node_buf,
             leaf_buf,
+            bounds_buf,
             n: res.voxels_per_axis(),
             k: res.internal_levels(),
         })
@@ -170,9 +173,10 @@ impl GpuTraverser {
             entries: &[
                 buffers::bind(0, self.node_buf.as_entire_binding()),
                 buffers::bind(1, self.leaf_buf.as_entire_binding()),
-                buffers::bind(2, ray_buf.as_entire_binding()),
-                buffers::bind(3, params_buf.as_entire_binding()),
-                buffers::bind(4, hits_buf.as_entire_binding()),
+                buffers::bind(2, self.bounds_buf.as_entire_binding()),
+                buffers::bind(3, ray_buf.as_entire_binding()),
+                buffers::bind(4, params_buf.as_entire_binding()),
+                buffers::bind(5, hits_buf.as_entire_binding()),
             ],
         });
 
@@ -193,7 +197,12 @@ impl GpuTraverser {
         encoder.copy_buffer_to_buffer(&hits_buf, 0, &readback, 0, hits_bytes);
         self.queue.submit(Some(encoder.finish()));
 
-        // Blocking readback.
+        self.read_hits(&readback)
+    }
+
+    /// Blocks until the dispatch completes, then maps `readback` and decodes the
+    /// `vec4<u32>` hits into `Option<VoxelCoord>` (`w == 1` ⇒ hit).
+    fn read_hits(&self, readback: &wgpu::Buffer) -> Result<Vec<Option<VoxelCoord>>, GpuError> {
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {

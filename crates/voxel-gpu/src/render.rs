@@ -51,6 +51,7 @@ pub struct GpuRenderer {
     layout: wgpu::BindGroupLayout,
     node_buf: wgpu::Buffer,
     leaf_buf: wgpu::Buffer,
+    bounds_buf: wgpu::Buffer,
     camera_buf: wgpu::Buffer,
 }
 
@@ -60,7 +61,7 @@ impl GpuRenderer {
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
 
-        let (node_buf, leaf_buf) =
+        let (node_buf, leaf_buf, bounds_buf) =
             buffers::upload_structure(&device, structure, ctx.max_storage_binding())?;
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
@@ -79,11 +80,12 @@ impl GpuRenderer {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("render layout"),
             entries: &[
-                buffers::storage_entry(0, true),
-                buffers::storage_entry(1, true),
-                buffers::uniform_entry(2),
+                buffers::storage_entry(0, true), // nodes
+                buffers::storage_entry(1, true), // leaf_words
+                buffers::storage_entry(2, true), // leaf_bounds
+                buffers::uniform_entry(3),       // camera
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
@@ -116,6 +118,7 @@ impl GpuRenderer {
             layout,
             node_buf,
             leaf_buf,
+            bounds_buf,
             camera_buf,
         })
     }
@@ -140,8 +143,9 @@ impl GpuRenderer {
             entries: &[
                 buffers::bind(0, self.node_buf.as_entire_binding()),
                 buffers::bind(1, self.leaf_buf.as_entire_binding()),
-                buffers::bind(2, self.camera_buf.as_entire_binding()),
-                buffers::bind(3, wgpu::BindingResource::TextureView(output)),
+                buffers::bind(2, self.bounds_buf.as_entire_binding()),
+                buffers::bind(3, self.camera_buf.as_entire_binding()),
+                buffers::bind(4, wgpu::BindingResource::TextureView(output)),
             ],
         });
 

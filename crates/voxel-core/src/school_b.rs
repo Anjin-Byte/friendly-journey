@@ -18,7 +18,7 @@
 //! shared leaf array exactly as in School A (§6.4, Option B).
 
 use crate::layout::{Cell, NodeLayout};
-use crate::leaf::LeafBrick;
+use crate::leaf::{LeafBounds, LeafBrick};
 use crate::node::GpuNode;
 use crate::{Resolution, SparseTree};
 
@@ -32,6 +32,9 @@ pub struct SchoolBBuffer {
     nodes: Vec<GpuNode>,
     /// Morton-sorted leaves, identical to the School-A array.
     leaves: Vec<LeafBrick>,
+    /// One packed [`LeafBounds`] per leaf (same index as `leaves`), precomputed
+    /// for the per-brick early-skip and uploaded as the GPU `leaf_bounds` buffer.
+    leaf_bounds: Vec<u32>,
 }
 
 /// Emits the children block of the node already placed at `nodes[pos]`, then
@@ -74,6 +77,7 @@ impl SchoolBBuffer {
     pub fn from_sparse(tree: &SparseTree) -> Self {
         let resolution = tree.resolution();
         let leaves = tree.leaves_slice().to_vec();
+        let leaf_bounds = leaves.iter().map(|l| l.occupied_bounds().pack()).collect();
         let mut nodes = Vec::new();
 
         let k = resolution.internal_levels();
@@ -88,6 +92,7 @@ impl SchoolBBuffer {
             resolution,
             nodes,
             leaves,
+            leaf_bounds,
         }
     }
 
@@ -101,6 +106,13 @@ impl SchoolBBuffer {
     #[must_use]
     pub fn leaves(&self) -> &[LeafBrick] {
         &self.leaves
+    }
+
+    /// The packed per-leaf [`LeafBounds`] words (one per leaf), for the GPU
+    /// `leaf_bounds` buffer and the `f32` mirror's early-skip.
+    #[must_use]
+    pub fn leaf_bounds_words(&self) -> &[u32] {
+        &self.leaf_bounds
     }
 
     /// Total node-buffer length.
@@ -141,6 +153,11 @@ impl NodeLayout for SchoolBBuffer {
     fn leaf(&self, idx: u32) -> &LeafBrick {
         &self.leaves[idx as usize]
     }
+
+    fn leaf_bounds(&self, idx: u32) -> LeafBounds {
+        // Read the precomputed packed word — the same bytes the GPU uploads.
+        LeafBounds::unpack(self.leaf_bounds[idx as usize])
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +183,23 @@ mod tests {
     #[allow(clippy::cast_precision_loss)]
     fn unit(state: &mut u64) -> f64 {
         (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn leaf_bounds_are_index_parallel_with_leaves() {
+        // The GPU `leaf_bounds` buffer is indexed by the same slot as the leaf
+        // words; the early-skip's correctness depends on the bounds array being
+        // index-parallel with `leaves`. Assert it explicitly.
+        let tree = SparseTree::build(&OctantFractal::sierpinski_tetrahedron(res(128)));
+        let b = SchoolBBuffer::from_sparse(&tree);
+        assert_eq!(b.leaf_bounds_words().len(), b.leaves().len());
+        for (i, leaf) in b.leaves().iter().enumerate() {
+            assert_eq!(
+                LeafBounds::unpack(b.leaf_bounds_words()[i]),
+                leaf.occupied_bounds(),
+                "leaf_bounds[{i}] disagrees with the leaf brick",
+            );
+        }
     }
 
     #[test]

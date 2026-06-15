@@ -1,5 +1,6 @@
 // Render-path entry point. Concatenated *after* traversal.wgsl, so the shared
-// `nodes`/`leaf_words` bindings and `traverse_ray` are already in scope.
+// structure bindings (`nodes`@0, `leaf_words`@1, `leaf_bounds`@2) and
+// `traverse_ray` are already in scope; per-call data starts at binding 3.
 //
 // One invocation per pixel: builds the camera ray, traverses, shades the hit by
 // voxel position, and writes the color straight to a storage texture — no
@@ -17,8 +18,8 @@ struct Camera {
     dims: vec4<u32>, // width, height, k, _
 }
 
-@group(0) @binding(2) var<uniform> camera: Camera;
-@group(0) @binding(3) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(3) var<uniform> camera: Camera;
+@group(0) @binding(4) var output: texture_storage_2d<rgba8unorm, write>;
 
 @compute @workgroup_size(8, 8)
 fn render_main(@builtin(global_invocation_id) gid: vec3<u32>) {
