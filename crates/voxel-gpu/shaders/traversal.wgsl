@@ -233,7 +233,9 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
     }
     // The cur frame lives here (registers); `stack` holds only its ancestors.
     var cur = make_frame(o, d, 0u, root_level, vec3<u32>(0u, 0u, 0u), t_entry);
-    var stack: array<Frame, 8>;
+    // EXP1: true max depth is 6 (voxel → leaf → ≤4 internal levels at 2048³);
+    // 8 wasted 2 frames of per-thread private memory.
+    var stack: array<Frame, 6>;
     var sp = 0u; // number of parent frames on the stack
 
     for (var iter = 0u; iter < 200000u; iter = iter + 1u) {

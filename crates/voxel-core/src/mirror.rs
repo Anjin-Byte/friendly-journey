@@ -18,8 +18,8 @@ use crate::ray::Ray;
 use crate::{SchoolBBuffer, VoxelCoord};
 
 /// Max traversal depth: voxel → leaf brick → up to 4 internal levels at 2048³,
-/// i.e. 6; `8` leaves head-room and matches the WGSL stack size.
-const MAX_DEPTH: usize = 8;
+/// i.e. 6 — the exact bound, matching the WGSL `stack` size (EXP1).
+const MAX_DEPTH: usize = 6;
 
 /// Truncates a cell-space coordinate to `[0, dim)`. The single audited
 /// `f32 → u32` site.
