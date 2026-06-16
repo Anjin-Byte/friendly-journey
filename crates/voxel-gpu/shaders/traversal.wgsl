@@ -90,21 +90,16 @@ fn leaf_reaches(slot: u32, o: vec3<f32>, d: vec3<f32>, origin: vec3<u32>, t_ente
     return t_far >= t_enter;
 }
 
-// EXP2: scalarized — the `vec3` members were each 16-byte-aligned in WGSL std
-// layout, wasting a 4-byte tail per vec3 (and the explicit `_pad`). Bare per-axis
-// scalars pack tightly (all align-4), shrinking the frame 112B → 76B and cutting
-// both the per-push/pop stack bytes and the private-memory footprint. Pure
-// storage change: the same scalars are written/read in the same order, so the
-// f32 math is byte-identical.
 struct Frame {
     node: u32,
     level: u32,
     dim: u32,
-    origin_x: u32, origin_y: u32, origin_z: u32,
-    cell_x: u32, cell_y: u32, cell_z: u32,
-    step_x: i32, step_y: i32, step_z: i32,
-    t_max_x: f32, t_max_y: f32, t_max_z: f32,
-    t_delta_x: f32, t_delta_y: f32, t_delta_z: f32,
+    _pad: u32,
+    origin: vec3<u32>,
+    cell: vec3<u32>,
+    step: vec3<i32>,
+    t_max: vec3<f32>,
+    t_delta: vec3<f32>,
     t_entry: f32,
 }
 
@@ -148,57 +143,58 @@ fn make_frame(o: vec3<f32>, d: vec3<f32>, node: u32, level: u32, origin: vec3<u3
     f.node = node;
     f.level = level;
     f.dim = dim;
-    f.origin_x = origin.x; f.origin_y = origin.y; f.origin_z = origin.z;
+    f.origin = origin;
     f.t_entry = t_enter;
-    f.cell_x = ax.cell; f.cell_y = ay.cell; f.cell_z = az.cell;
-    f.step_x = ax.step; f.step_y = ay.step; f.step_z = az.step;
-    f.t_max_x = ax.t_max; f.t_max_y = ay.t_max; f.t_max_z = az.t_max;
-    f.t_delta_x = ax.t_delta; f.t_delta_y = ay.t_delta; f.t_delta_z = az.t_delta;
+    f.cell = vec3<u32>(ax.cell, ay.cell, az.cell);
+    f.step = vec3<i32>(ax.step, ay.step, az.step);
+    f.t_max = vec3<f32>(ax.t_max, ay.t_max, az.t_max);
+    f.t_delta = vec3<f32>(ax.t_delta, ay.t_delta, az.t_delta);
     return f;
 }
 
 fn walker_step(f: ptr<function, Frame>) -> bool {
+    let tm = (*f).t_max;
     var a = 0u;
-    var best = (*f).t_max_x;
-    if ((*f).t_max_y < best) { a = 1u; best = (*f).t_max_y; }
-    if ((*f).t_max_z < best) { a = 2u; best = (*f).t_max_z; }
+    var best = tm.x;
+    if (tm.y < best) { a = 1u; best = tm.y; }
+    if (tm.z < best) { a = 2u; best = tm.z; }
 
     if (a == 0u) {
-        let s = (*f).step_x;
+        let s = (*f).step.x;
         if (s == 0) { return false; }
         if (s > 0) {
-            if ((*f).cell_x + 1u >= (*f).dim) { return false; }
-            (*f).cell_x = (*f).cell_x + 1u;
+            if ((*f).cell.x + 1u >= (*f).dim) { return false; }
+            (*f).cell.x = (*f).cell.x + 1u;
         } else {
-            if ((*f).cell_x == 0u) { return false; }
-            (*f).cell_x = (*f).cell_x - 1u;
+            if ((*f).cell.x == 0u) { return false; }
+            (*f).cell.x = (*f).cell.x - 1u;
         }
-        (*f).t_entry = (*f).t_max_x;
-        (*f).t_max_x = (*f).t_max_x + (*f).t_delta_x;
+        (*f).t_entry = (*f).t_max.x;
+        (*f).t_max.x = (*f).t_max.x + (*f).t_delta.x;
     } else if (a == 1u) {
-        let s = (*f).step_y;
+        let s = (*f).step.y;
         if (s == 0) { return false; }
         if (s > 0) {
-            if ((*f).cell_y + 1u >= (*f).dim) { return false; }
-            (*f).cell_y = (*f).cell_y + 1u;
+            if ((*f).cell.y + 1u >= (*f).dim) { return false; }
+            (*f).cell.y = (*f).cell.y + 1u;
         } else {
-            if ((*f).cell_y == 0u) { return false; }
-            (*f).cell_y = (*f).cell_y - 1u;
+            if ((*f).cell.y == 0u) { return false; }
+            (*f).cell.y = (*f).cell.y - 1u;
         }
-        (*f).t_entry = (*f).t_max_y;
-        (*f).t_max_y = (*f).t_max_y + (*f).t_delta_y;
+        (*f).t_entry = (*f).t_max.y;
+        (*f).t_max.y = (*f).t_max.y + (*f).t_delta.y;
     } else {
-        let s = (*f).step_z;
+        let s = (*f).step.z;
         if (s == 0) { return false; }
         if (s > 0) {
-            if ((*f).cell_z + 1u >= (*f).dim) { return false; }
-            (*f).cell_z = (*f).cell_z + 1u;
+            if ((*f).cell.z + 1u >= (*f).dim) { return false; }
+            (*f).cell.z = (*f).cell.z + 1u;
         } else {
-            if ((*f).cell_z == 0u) { return false; }
-            (*f).cell_z = (*f).cell_z - 1u;
+            if ((*f).cell.z == 0u) { return false; }
+            (*f).cell.z = (*f).cell.z - 1u;
         }
-        (*f).t_entry = (*f).t_max_z;
-        (*f).t_max_z = (*f).t_max_z + (*f).t_delta_z;
+        (*f).t_entry = (*f).t_max.z;
+        (*f).t_max.z = (*f).t_max.z + (*f).t_delta.z;
     }
     return true;
 }
@@ -244,9 +240,9 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
 
     for (var iter = 0u; iter < 200000u; iter = iter + 1u) {
         if (cur.level == 1u) {
-            let v = vec3<u32>(cur.cell_x, cur.cell_y, cur.cell_z);
+            let v = cur.cell;
             if (leaf_bit(cur.node, v)) {
-                let org = vec3<u32>(cur.origin_x, cur.origin_y, cur.origin_z);
+                let org = cur.origin;
                 return vec4<u32>(org.x + v.x, org.y + v.y, org.z + v.z, 1u);
             }
             if (walker_step(&cur)) { continue; }
@@ -258,12 +254,12 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
                 if (walker_step(&cur)) { break; }
             }
         } else {
-            let c = vec3<u32>(cur.cell_x, cur.cell_y, cur.cell_z);
+            let c = cur.cell;
             let bit = child_bit(c);
             let node = nodes[cur.node];
             let child_level = cur.level - 1u;
             let size = cell_size_of(cur.level);
-            let child_origin = vec3<u32>(cur.origin_x, cur.origin_y, cur.origin_z) + c * size;
+            let child_origin = cur.origin + c * size;
             var descend = has_child(node, bit);
             var slot = 0u;
             if (descend) {
