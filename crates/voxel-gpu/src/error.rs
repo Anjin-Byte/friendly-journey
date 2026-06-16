@@ -37,9 +37,9 @@ pub enum GpuError {
     #[error("GPU capture failed: {0}")]
     Capture(String),
 
-    /// A GPU operation is not supported at this resolution — e.g. the dense
-    /// noise generator, whose linear voxel index `x + y·n + z·n²` must fit `u32`
-    /// (so `n ≤ 1290`; `2048³` overflows). The caller falls back to the CPU path.
+    /// A GPU operation is not supported at this resolution — e.g. the dense noise
+    /// generator, whose `n³/32`-word output must fit `u32`/the binding limit (so up
+    /// to `2048³`; `8192³` overflows). The caller falls back to the CPU path.
     #[error("GPU operation unsupported at {n}³: {reason}")]
     Unsupported {
         /// The resolution that exceeded a GPU limit.
