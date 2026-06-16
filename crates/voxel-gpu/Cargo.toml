@@ -15,5 +15,13 @@ thiserror = { workspace = true }
 pollster = { workspace = true }
 glam = { workspace = true }
 
+# Programmatic GPU-trace capture (write a .gputrace for Xcode) — macOS only.
+# Pinned to the versions wgpu's Metal backend already pulls in, so no duplicate;
+# objc2 is feature-gated per Objective-C class, hence the explicit feature lists.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError"] }
+objc2-metal = { version = "0.3", features = ["MTLCaptureManager", "MTLDevice"] }
+
 [lints]
 workspace = true

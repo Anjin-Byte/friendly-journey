@@ -148,6 +148,12 @@ struct CaptureArgs {
     /// needs a longer sample; the harness prints the elapsed wall-time.
     #[arg(long, default_value_t = 1000)]
     iters: u32,
+    /// Instead of looping for an external profiler, write a `.gputrace` document
+    /// (a few dispatches) you open directly in Xcode — full counters + shader
+    /// profiler, no attaching. Needs `METAL_CAPTURE_ENABLED=1` (see `make
+    /// gputrace`).
+    #[arg(long)]
+    gputrace: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1033,25 +1039,38 @@ fn capture_cmd(args: &CaptureArgs) -> Result<()> {
         search_ns,
         rays.len(),
     );
-    println!(
-        "  looping {} kernel dispatches — attach Xcode GPU capture or Instruments\n  (Metal System Trace) NOW and read counters per CAPTURE.md",
-        args.iters
-    );
-
     let _ = traverser.traverse(&rays[..rays.len().min(2000)])?; // warm
-    let t = std::time::Instant::now();
-    for _ in 0..args.iters {
-        let _ = traverser.traverse(&rays)?;
+
+    if args.gputrace {
+        // Write a Xcode-openable trace document wrapping a few dispatches.
+        let path = format!("{}-{}.gputrace", fixture_name(args.fixture), args.res);
+        println!("  writing a GPU trace document ({path})…");
+        voxel_gpu::capture_gputrace(std::path::Path::new(&path), || {
+            for _ in 0..4 {
+                traverser.traverse(&rays)?;
+            }
+            Ok(())
+        })?;
+        println!("  wrote {path} — open it in Xcode:  open {path}");
+    } else {
+        println!(
+            "  looping {} kernel dispatches — record an Instruments Metal System\n  Trace now and read counters per CAPTURE.md",
+            args.iters
+        );
+        let t = std::time::Instant::now();
+        for _ in 0..args.iters {
+            let _ = traverser.traverse(&rays)?;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let total = rays.len() as f64 * f64::from(args.iters);
+        println!(
+            "  done: {} dispatches in {:.2}s  ({:.1} Mrays/s, {:.1} ns/ray wall)",
+            args.iters,
+            secs,
+            total / secs / 1e6,
+            secs / total * 1e9,
+        );
     }
-    let secs = t.elapsed().as_secs_f64();
-    let total = rays.len() as f64 * f64::from(args.iters);
-    println!(
-        "  done: {} dispatches in {:.2}s  ({:.1} Mrays/s, {:.1} ns/ray wall)",
-        args.iters,
-        secs,
-        total / secs / 1e6,
-        secs / total * 1e9,
-    );
     Ok(())
 }
 

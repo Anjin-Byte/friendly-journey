@@ -32,4 +32,8 @@ pub enum GpuError {
     /// The device was polled and reported an internal failure.
     #[error("GPU device poll failed")]
     Poll,
+
+    /// A programmatic GPU-trace capture could not be started or written.
+    #[error("GPU capture failed: {0}")]
+    Capture(String),
 }

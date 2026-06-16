@@ -84,6 +84,11 @@ edit: ## edit-performance suite; add SWEEP=1 for the fixture×res table
 capture: ## loop the worst-orientation kernel as a profiler target (ITERS)
 	$(CLI) capture --fixture $(FIXTURE) --res $(RES) --iters $(ITERS)
 
+.PHONY: gputrace
+gputrace: build ## write a .gputrace at the worst orientation and open it in Xcode (FIXTURE, RES)
+	METAL_CAPTURE_ENABLED=1 $(BIN) capture --fixture $(FIXTURE) --res $(RES) --gputrace
+	open ./$(FIXTURE)-$(RES).gputrace
+
 .PHONY: trace
 trace: build ## record a Metal System Trace of the capture target → .trace (needs full Xcode)
 	@xcrun -f xctrace >/dev/null 2>&1 || { \

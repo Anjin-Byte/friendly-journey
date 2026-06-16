@@ -36,8 +36,22 @@ far more thermally robust than the absolute-ns path the project distrusts.
 
 ## 2. Capture the counters
 
-`wgpu` does not expose `MTLCaptureManager`, so use Apple's external tooling. Two
-routes; the second is better for the counters we need:
+**Easiest — write a trace document directly (recommended).** `voxel capture
+--gputrace` drives `MTLCaptureManager` itself and writes an Xcode-openable
+`.gputrace` (a few dispatches at the worst orientation) — no attaching, no
+`xctrace`, no scheme. It needs `METAL_CAPTURE_ENABLED=1`, which the make target
+sets:
+
+```sh
+make gputrace RES=2048           # writes dust-2048.gputrace and opens it in Xcode
+make gputrace RES=512
+```
+
+Open it (the make target does this for you) and you land in Xcode's GPU debugger
+with the full counter set **and** the shader profiler — the per-load view that
+distinguishes `leaf_words` from `nodes`. This is the path to the §3/§4 reads.
+
+The external routes below still work if you prefer them:
 
 - **Xcode → Debug → Capture GPU Workload** — attach to the running `voxel`
   process (you may need `METAL_CAPTURE_ENABLED=1` in the environment). Good for

@@ -12,11 +12,13 @@
 //! compiles; handling the absence of a GPU is the caller's job.
 
 mod buffers;
+mod capture;
 mod context;
 mod error;
 mod render;
 mod traverse;
 
+pub use capture::capture_gputrace;
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use render::{GpuCamera, GpuRenderer, OUTPUT_FORMAT};
