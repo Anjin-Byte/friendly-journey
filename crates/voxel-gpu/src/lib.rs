@@ -22,6 +22,6 @@ mod traverse;
 pub use capture::capture_gputrace;
 pub use context::GpuContext;
 pub use error::GpuError;
-pub use generate::{generate_noise_occupancy, generate_noise_tree};
+pub use generate::generate_noise_tree;
 pub use render::{GpuCamera, GpuRenderer, OUTPUT_FORMAT};
 pub use traverse::GpuTraverser;

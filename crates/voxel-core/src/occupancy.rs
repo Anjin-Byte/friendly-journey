@@ -50,29 +50,6 @@ impl BitGrid {
         }
     }
 
-    /// Builds a grid directly from pre-computed packed words — e.g. a GPU
-    /// occupancy generator that evaluated the field in parallel and read the bits
-    /// back. `words` must be exactly `ceil(n³/64)` `u64`s in the same
-    /// `x + y·n + z·n²` bit order [`set`](Self::set) uses (bit `i` in word `i/64`,
-    /// little-endian within the word).
-    ///
-    /// # Panics
-    /// Panics if `words.len()` is not the exact word count for `resolution` —
-    /// a layout-contract violation, caught at the boundary rather than silently
-    /// producing a corrupt grid.
-    #[must_use]
-    pub fn from_raw(resolution: Resolution, words: Vec<u64>) -> Self {
-        let expected = usize::try_from(resolution.total_voxels().div_ceil(64))
-            .expect("dense BitGrid too large for this platform; use a procedural field");
-        assert_eq!(
-            words.len(),
-            expected,
-            "BitGrid::from_raw word count mismatch for {}³",
-            resolution.voxels_per_axis()
-        );
-        Self { resolution, words }
-    }
-
     /// Materializes a procedural field into a dense grid (small resolutions).
     #[must_use]
     pub fn from_field<F: OccupancyField>(field: &F) -> Self {

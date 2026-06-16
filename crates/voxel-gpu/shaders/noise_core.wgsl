@@ -1,6 +1,5 @@
-// Shared noise core for the GPU occupancy generators — concatenated ahead of a
-// kernel that consumes `occupied(x, y, z)` (see `noise_gen.wgsl`, the dense
-// bitset, and `noise_gen_bricks.wgsl`, the compacted-leaf path).
+// Shared noise core for the GPU occupancy generator — concatenated ahead of the
+// kernel that consumes `occupied(x, y, z)` (see `noise_gen_bricks.wgsl`).
 //
 // A direct f32 port of `voxel-core`'s `noise.rs` (Perlin improved-noise gradient
 // → fBm/ridged `fractal` → `domain_warp`) plus `NoiseField::value`. The CPU f64
@@ -12,7 +11,7 @@ struct Params {
     seed: u32,
     octaves: u32,
     ridged: u32,      // bool
-    total_words: u32, // n³ / 32 (dense path) — unused by the brick path
+    _reserved: u32,   // reserved (kept for std140 layout); unused
     frequency: f32,
     lacunarity: f32,
     gain: f32,
