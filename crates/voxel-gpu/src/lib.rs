@@ -15,11 +15,13 @@ mod buffers;
 mod capture;
 mod context;
 mod error;
+mod generate;
 mod render;
 mod traverse;
 
 pub use capture::capture_gputrace;
 pub use context::GpuContext;
 pub use error::GpuError;
+pub use generate::generate_noise_occupancy;
 pub use render::{GpuCamera, GpuRenderer, OUTPUT_FORMAT};
 pub use traverse::GpuTraverser;
