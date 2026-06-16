@@ -826,8 +826,8 @@ impl Viewer {
 /// falling back to the CPU build otherwise (no adapter, or `n³` past the GPU
 /// generator's `u32` index cap at 2048³).
 fn build_noise(ctx: &GpuContext, field: &NoiseField) -> SparseTree {
-    match voxel_gpu::generate_noise_occupancy(ctx, field) {
-        Ok(grid) => SparseTree::build(&grid),
+    match voxel_gpu::generate_noise_tree(ctx, field) {
+        Ok(tree) => tree,
         Err(e) => {
             eprintln!("GPU noise generation unavailable ({e}); building on CPU");
             SparseTree::build(field)

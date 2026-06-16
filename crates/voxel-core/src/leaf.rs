@@ -180,6 +180,19 @@ impl LeafBrick {
         }
         out
     }
+
+    /// Rebuilds a brick from 16 little-endian `u32` words — the inverse of
+    /// [`words32`](Self::words32). For a GPU generator that packs the 512-bit
+    /// Morton mask straight into a `u32` storage buffer (bit for Morton index `i`
+    /// at `words[i >> 5] & (1 << (i & 31))`) and reads it back.
+    #[must_use]
+    pub fn from_words32(words: [u32; 16]) -> Self {
+        let mut bits = [0u64; 8];
+        for (i, b) in bits.iter_mut().enumerate() {
+            *b = u64::from(words[i * 2]) | (u64::from(words[i * 2 + 1]) << 32);
+        }
+        Self { bits }
+    }
 }
 
 impl Default for LeafBrick {
