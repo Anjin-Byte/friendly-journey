@@ -184,7 +184,6 @@ impl SparseTree {
     #[must_use]
     pub fn build<F: OccupancyField + Sync>(field: &F) -> Self {
         let resolution = field.resolution();
-        let k = resolution.internal_levels();
         let bpa = resolution.voxels_per_axis() / 8;
 
         // 1. Enumerate occupied bricks (Morton code + 512-bit leaf). This scan
@@ -196,7 +195,7 @@ impl SparseTree {
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(1)
             .clamp(1, bpa.max(1));
-        let mut bricks: Vec<(u64, LeafBrick)> = std::thread::scope(|scope| {
+        let bricks: Vec<(u64, LeafBrick)> = std::thread::scope(|scope| {
             let chunk = bpa.div_ceil(threads);
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
@@ -211,12 +210,26 @@ impl SparseTree {
                 .collect()
         });
 
-        // 2. Sort by Morton code (codes are unique, so order is total).
+        // 2–4. Sort the occupied bricks and build the internal levels.
+        Self::from_bricks(resolution, bricks)
+    }
+
+    /// Assembles the sparse hierarchy from already-enumerated occupied bricks —
+    /// `(Morton code, leaf)` pairs in any order, where the code is
+    /// [`morton::encode`](crate::morton::encode)`(bx, by, bz)` of the brick. This
+    /// is steps 2–4 of [`build`](Self::build) for callers that enumerated the
+    /// occupancy themselves (e.g. a GPU generator that evaluated the field in
+    /// parallel and read back only the non-empty bricks), skipping the per-voxel
+    /// CPU scan entirely.
+    #[must_use]
+    pub fn from_bricks(resolution: Resolution, mut bricks: Vec<(u64, LeafBrick)>) -> Self {
+        let k = resolution.internal_levels();
+        // Sort by Morton code (codes are unique, so the order is total).
         bricks.sort_unstable_by_key(|(code, _)| *code);
         let leaves: Vec<LeafBrick> = bricks.iter().map(|(_, leaf)| *leaf).collect();
         let codes: Vec<u64> = bricks.into_iter().map(|(code, _)| code).collect();
 
-        // 3–4. Build internal levels 2..=k+1 bottom-up by OR-reducing 4³ groups.
+        // Build internal levels 2..=k+1 bottom-up by OR-reducing 4³ groups.
         let nodes = build_levels(k, &codes);
 
         Self {
