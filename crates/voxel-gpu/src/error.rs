@@ -36,4 +36,15 @@ pub enum GpuError {
     /// A programmatic GPU-trace capture could not be started or written.
     #[error("GPU capture failed: {0}")]
     Capture(String),
+
+    /// A GPU operation is not supported at this resolution — e.g. the dense
+    /// noise generator, whose linear voxel index `x + y·n + z·n²` must fit `u32`
+    /// (so `n ≤ 1290`; `2048³` overflows). The caller falls back to the CPU path.
+    #[error("GPU operation unsupported at {n}³: {reason}")]
+    Unsupported {
+        /// The resolution that exceeded a GPU limit.
+        n: u32,
+        /// Why it is unsupported.
+        reason: &'static str,
+    },
 }
