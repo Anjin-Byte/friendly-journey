@@ -47,6 +47,7 @@ pub use crate::error::{VoxelizeGpuError, VoxelizerError};
 pub use crate::gpu::{GpuVoxelizer, GpuVoxelizerConfig};
 #[cfg(any(feature = "gltf", feature = "obj", feature = "stl"))]
 pub use crate::loader::load_mesh;
+pub use crate::loader::rotation_degrees;
 #[cfg(feature = "gltf")]
 pub use crate::loader::{load_gltf_path, load_gltf_slice};
 #[cfg(feature = "obj")]

@@ -31,13 +31,13 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use voxel_core::fixtures::{Checkerboard, Dust, NoiseField, OctantFractal, WireLattice};
 use voxel_core::{
     Edit, Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, brush_voxels, traverse,
 };
 use voxel_gpu::{GpuCamera, GpuContext, GpuRenderer};
-use voxelizer::loader::load_mesh;
+use voxelizer::loader::{load_mesh, rotation_degrees};
 use voxelizer::{GpuVoxelizer, GpuVoxelizerConfig, TileSpec, VoxelGrid, VoxelizeOpts};
 use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
 use winit::application::ApplicationHandler;
@@ -78,6 +78,18 @@ struct Args {
     /// grid (only used with `--mesh`).
     #[arg(long, default_value_t = 2.0)]
     padding: f32,
+    /// Corrective rotation about X in degrees, applied to `--mesh` before fitting
+    /// the grid. Re-orients transform-less formats (OBJ/STL) whose exporter used
+    /// a different up-axis (e.g. `--rotate-x -90` for a Z-up model in this Y-up
+    /// view).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_x: f32,
+    /// Corrective rotation about Y in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_y: f32,
+    /// Corrective rotation about Z in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_z: f32,
     /// Cap the frame rate to the display refresh (off by default, so the
     /// profile reflects raw GPU throughput).
     #[arg(long)]
@@ -352,7 +364,13 @@ impl Viewer {
             );
             (
                 label,
-                build_from_mesh(&ctx, resolution, mesh_path, args.padding)?,
+                build_from_mesh(
+                    &ctx,
+                    resolution,
+                    mesh_path,
+                    args.padding,
+                    rotation_degrees(args.rotate_x, args.rotate_y, args.rotate_z),
+                )?,
             )
         } else {
             eprintln!(
@@ -868,9 +886,14 @@ fn build_from_mesh(
     resolution: Resolution,
     path: &Path,
     padding: f32,
+    rotation: Mat4,
 ) -> Result<(SparseTree, SchoolBBuffer)> {
-    let mesh = load_mesh(path).with_context(|| format!("loading mesh {}", path.display()))?;
+    let mut mesh = load_mesh(path).with_context(|| format!("loading mesh {}", path.display()))?;
     eprintln!("  {} triangles", mesh.triangles.len());
+    // Re-orient transform-less formats before measuring the bounding box.
+    if rotation != Mat4::IDENTITY {
+        mesh.transform(rotation);
+    }
     let grid = VoxelGrid::fit_mesh(resolution, &mesh, padding);
     let tiles = TileSpec::new([4, 4, 4], grid.dims())?;
     let opts = VoxelizeOpts {

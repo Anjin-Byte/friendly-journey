@@ -16,7 +16,7 @@ use voxel_core::{
     mirror_traverse,
 };
 use voxel_gpu::{GpuContext, GpuError, GpuRenderer, GpuTraverser};
-use voxelizer::loader::load_mesh;
+use voxelizer::loader::{load_mesh, rotation_degrees};
 use voxelizer::reference_cpu::voxelize_surface_cpu;
 use voxelizer::{
     GpuVoxelizer, GpuVoxelizerConfig, MeshInput, TileSpec, VoxelGrid, VoxelOccupancy, VoxelizeOpts,
@@ -71,6 +71,17 @@ struct VoxelizeArgs {
     /// into the cubic grid.
     #[arg(long, default_value_t = 2.0)]
     padding: f32,
+    /// Corrective rotation about X in degrees, applied before fitting the grid.
+    /// Re-orients transform-less formats (OBJ/STL) whose exporter used a
+    /// different up-axis (e.g. `--rotate-x -90` for a Z-up model in a Y-up view).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_x: f32,
+    /// Corrective rotation about Y in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_y: f32,
+    /// Corrective rotation about Z in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_z: f32,
     /// Which voxelizer to run.
     #[arg(long, value_enum, default_value_t = Backend::Auto)]
     backend: Backend,
@@ -1184,8 +1195,16 @@ fn fmt_dir(d: DVec3) -> String {
 
 fn voxelize_cmd(args: &VoxelizeArgs) -> Result<()> {
     let resolution = Resolution::new(args.res)?;
-    let mesh =
+    let mut mesh =
         load_mesh(&args.input).with_context(|| format!("loading mesh {}", args.input.display()))?;
+    // Re-orient transform-less formats before measuring the bounding box.
+    if args.rotate_x != 0.0 || args.rotate_y != 0.0 || args.rotate_z != 0.0 {
+        mesh.transform(rotation_degrees(
+            args.rotate_x,
+            args.rotate_y,
+            args.rotate_z,
+        ));
+    }
     tracing::info!(
         triangles = mesh.triangles.len(),
         n = resolution.voxels_per_axis(),

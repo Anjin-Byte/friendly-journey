@@ -528,4 +528,99 @@ mod tests {
             "injected-device voxelizer under-marked vs the CPU oracle"
         );
     }
+
+    /// Regression for the `u32` overflow of the global occupancy index at 2048³:
+    /// `gx + n·gy + n²·gz` reaches 8.6e9 > `u32::MAX`, overflowing for `gz > 1024`,
+    /// so the GPU silently dropped the top half of the model. Needs a device with
+    /// the adapter's real storage limits (the 2048³ occupancy buffer is ~1 GiB —
+    /// `new_standalone`'s default 128 MiB would reject it), so it builds its own.
+    /// Heavy (≈1 GiB buffers), so it is `#[ignore]`d — run with `--ignored`.
+    #[test]
+    #[ignore = "2048³ needs a ~1 GiB occupancy buffer + a high-limit GPU; run explicitly"]
+    fn gpu_no_u32_overflow_at_2048() {
+        use crate::core::{MeshInput, TileSpec, VoxelGrid, VoxelizeOpts};
+        use crate::gpu::GpuVoxelizer;
+        use crate::reference_cpu::voxelize_surface_cpu;
+        use glam::Vec3;
+        use voxel_core::Resolution;
+
+        // Default limits cap storage at 128 MiB → 2048³ would StorageExceeded.
+        // Build a device with the adapter's real storage/buffer limits instead.
+        let made = pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .ok()?;
+            let al = adapter.limits();
+            let limits = wgpu::Limits {
+                max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
+                max_buffer_size: al.max_buffer_size,
+                ..wgpu::Limits::default()
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_limits: limits,
+                    ..Default::default()
+                })
+                .await
+                .ok()?;
+            Some((device, queue))
+        });
+        let Some((device, queue)) = made else {
+            return; // no adapter — skip
+        };
+        let vox = pollster::block_on(GpuVoxelizer::from_device(
+            &device,
+            &queue,
+            GpuVoxelizerConfig::default(),
+        ))
+        .expect("from_device on a high-limit device");
+
+        let grid = VoxelGrid::new(Resolution::new(2048).unwrap(), Vec3::ZERO, 1.0);
+        let tiles = TileSpec::new([4, 4, 4], grid.dims()).unwrap();
+        let opts = VoxelizeOpts {
+            epsilon: 1e-4,
+            store_owner: false,
+            store_color: false,
+        };
+        // A vertical quad at y=1024 spanning x,z fully (thin in y → the CPU oracle
+        // scans one slab, stays feasible). Its voxels reach gz≈2044, deep in the
+        // gz>1024 region whose global index overflowed u32 before the fix.
+        let mesh = MeshInput {
+            triangles: vec![
+                [
+                    Vec3::new(4.0, 1024.0, 4.0),
+                    Vec3::new(2044.0, 1024.0, 4.0),
+                    Vec3::new(2044.0, 1024.0, 2044.0),
+                ],
+                [
+                    Vec3::new(4.0, 1024.0, 4.0),
+                    Vec3::new(2044.0, 1024.0, 2044.0),
+                    Vec3::new(4.0, 1024.0, 2044.0),
+                ],
+            ],
+            material_ids: None,
+        };
+
+        let cpu = voxelize_surface_cpu(&mesh, &grid, &tiles, &opts);
+        assert!(
+            cpu.occupancy.count_occupied() > 1_000_000,
+            "the fixture must occupy many high-z voxels"
+        );
+        let gpu = pollster::block_on(vox.voxelize_surface(&mesh, &grid, &tiles, &opts))
+            .expect("voxelize at 2048³");
+        // The fix's invariant: no under-marking (the overflow dropped ~half).
+        let under: u64 = cpu
+            .occupancy
+            .words()
+            .iter()
+            .zip(gpu.occupancy.words())
+            .map(|(c, g)| u64::from((c & !g).count_ones()))
+            .sum();
+        assert_eq!(
+            under, 0,
+            "GPU under-marked {under} voxels at 2048³ — the u32 occupancy-index overflow regressed"
+        );
+    }
 }

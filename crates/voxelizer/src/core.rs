@@ -321,6 +321,21 @@ pub struct MeshInput {
 }
 
 impl MeshInput {
+    /// Applies an affine transform to every vertex in place.
+    ///
+    /// Formats without a scene graph (OBJ, STL) deliver vertices in raw model
+    /// space, so an exporter's up-axis convention bakes straight into the soup.
+    /// This lets a caller re-orient (or scale/translate) the mesh before
+    /// [`VoxelGrid::fit_mesh`] measures its bounding box. A pure rotation leaves
+    /// the fit unchanged in size and only changes which way the model lies.
+    pub fn transform(&mut self, m: Mat4) {
+        for tri in &mut self.triangles {
+            for v in tri {
+                *v = m.transform_point3(*v);
+            }
+        }
+    }
+
     /// Validates the mesh: material-id length matches, all vertices finite.
     ///
     /// # Errors
@@ -560,6 +575,32 @@ mod tests {
         let ok = VoxelGrid::new(res8(), Vec3::ZERO, f32::MIN_POSITIVE);
         assert!(ok.validate().is_ok());
         assert!((1.0_f32 / f32::MIN_POSITIVE).is_finite());
+    }
+
+    #[test]
+    fn transform_rotates_vertices_in_place() {
+        // A +90° rotation about X sends +Y → +Z (right-handed): a vertex on the
+        // Y axis lands on the Z axis. Tolerant compare — the rotation is f32.
+        let mut mesh = MeshInput {
+            triangles: vec![[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ]],
+            material_ids: None,
+        };
+        mesh.transform(Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2));
+        let rotated = mesh.triangles[0][2];
+        assert!(
+            (rotated - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-6,
+            "+90° about X must map +Y → +Z, got {rotated:?}"
+        );
+        // The other two vertices (origin, +X) are on/parallel to the axis.
+        assert!((mesh.triangles[0][0]).length() < 1e-6, "origin is fixed");
+        assert!(
+            (mesh.triangles[0][1] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6,
+            "+X is fixed under an X rotation"
+        );
     }
 
     #[test]

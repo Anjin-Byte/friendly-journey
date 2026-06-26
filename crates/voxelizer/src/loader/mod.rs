@@ -38,6 +38,24 @@ pub use stl::{load_stl_path, load_stl_slice};
 
 use crate::core::MeshInput;
 use crate::error::VoxelizerError;
+use glam::Mat4;
+
+/// Builds a corrective rotation from per-axis angles in **degrees**.
+///
+/// Transform-less formats (OBJ, STL) bake an exporter's up-axis convention
+/// directly into the vertices, so a model authored Z-up arrives lying on its
+/// back when the renderer is Y-up. Feed the result to [`MeshInput::transform`]
+/// before fitting the grid to re-orient it.
+///
+/// Rotations compose **X, then Y, then Z** (`Rz · Ry · Rx`), so the angles read
+/// as "roll the model `x` about X, then `y` about Y, then `z` about Z." A single
+/// nonzero axis is unambiguous regardless of order. All-zero yields the identity.
+#[must_use]
+pub fn rotation_degrees(x: f32, y: f32, z: f32) -> Mat4 {
+    Mat4::from_rotation_z(z.to_radians())
+        * Mat4::from_rotation_y(y.to_radians())
+        * Mat4::from_rotation_x(x.to_radians())
+}
 
 /// Load a mesh from a filesystem path, dispatching on the file extension.
 ///
@@ -78,6 +96,21 @@ pub fn load_mesh(path: impl AsRef<std::path::Path>) -> Result<MeshInput, Voxeliz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_degrees_identity_and_x90() {
+        use glam::Vec3;
+
+        // All-zero is the identity (exact: from_rotation_*(0) is bit-clean).
+        assert_eq!(rotation_degrees(0.0, 0.0, 0.0), Mat4::IDENTITY);
+
+        // +90° about X sends +Y → +Z (matches `MeshInput::transform`'s test).
+        let p = rotation_degrees(90.0, 0.0, 0.0).transform_point3(Vec3::Y);
+        assert!(
+            (p - Vec3::Z).length() < 1e-6,
+            "+90° about X must map +Y → +Z, got {p:?}"
+        );
+    }
 
     #[test]
     fn load_mesh_rejects_unknown_extension() {
