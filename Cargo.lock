@@ -2272,6 +2272,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "voxelizer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "pollster",
+ "proptest",
+ "thiserror 2.0.18",
+ "voxel-core",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

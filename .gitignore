@@ -1,5 +1,9 @@
 /target
+# A member crate built standalone (before joining the workspace) leaves its own
+# target/; ignore those too so they never get committed.
+**/target/
 **/*.rs.bk
+.DS_Store
 
 # GPU profiler captures (make trace / programmatic .gputrace).
 *.trace
