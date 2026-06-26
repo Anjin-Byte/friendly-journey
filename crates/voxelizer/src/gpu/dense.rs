@@ -300,6 +300,9 @@ impl GpuVoxelizer {
         opts: &VoxelizeOpts,
     ) -> Params {
         let grid_dims = grid.dims();
+        let num_tiles = u32::try_from(tiles.num_tiles_total()).unwrap_or(u32::MAX);
+        let workgroups = num_tiles.div_ceil(self.tiles_per_workgroup);
+        let (dispatch_x, dispatch_y, _dispatch_z) = self.dense_workgroup_dims(workgroups);
         Params {
             grid_dims: [grid_dims[0], grid_dims[1], grid_dims[2], 0],
             tile_dims: [
@@ -315,12 +318,12 @@ impl GpuVoxelizer {
                 0,
             ],
             num_triangles: mesh.triangles.len() as u32,
-            num_tiles: u32::try_from(tiles.num_tiles_total()).unwrap_or(u32::MAX),
+            num_tiles,
             tile_voxels: tiles.tile_dims[0] * tiles.tile_dims[1] * tiles.tile_dims[2],
             store_owner: u32::from(opts.store_owner),
             store_color: u32::from(opts.store_color),
             debug: 0,
-            _pad0: [0, 0],
+            dispatch_xy: [dispatch_x, dispatch_y],
         }
     }
 
@@ -380,7 +383,17 @@ impl GpuVoxelizer {
     ) -> Result<(), VoxelizeGpuError> {
         let num_tiles = u32::try_from(tiles.num_tiles_total()).unwrap_or(u32::MAX);
         let workgroups = num_tiles.div_ceil(self.tiles_per_workgroup);
-        self.ensure_workgroups_fit(workgroups, "dense dispatch")?;
+        // Spread the workgroups over 3 dispatch dimensions so each stays within the
+        // device's per-dimension limit (the shader linearizes wg_id). Only a grid
+        // needing z beyond the limit is unrepresentable in one dispatch.
+        let (dx, dy, dz) = self.dense_workgroup_dims(workgroups);
+        if dz > self.max_compute_workgroups_per_dimension {
+            return Err(VoxelizeGpuError::WorkgroupsExceeded {
+                label: "dense dispatch",
+                workgroups,
+                limit: self.max_compute_workgroups_per_dimension,
+            });
+        }
 
         let mut encoder = self
             .device
@@ -395,7 +408,7 @@ impl GpuVoxelizer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(dx, dy, dz);
         }
 
         self.queue.submit([encoder.finish()]);
@@ -502,7 +515,7 @@ mod tests {
     /// Builds a GPU voxelizer, or returns `None` (skip) when no adapter exists.
     /// Panics on any non-`NoAdapter` init failure so a real regression is loud.
     fn gpu_or_skip() -> Option<GpuVoxelizer> {
-        match pollster::block_on(GpuVoxelizer::new(GpuVoxelizerConfig::default())) {
+        match pollster::block_on(GpuVoxelizer::new_standalone(GpuVoxelizerConfig::default())) {
             Ok(v) => Some(v),
             Err(VoxelizeGpuError::NoAdapter) => None,
             Err(e) => panic!("GPU init failed (not NoAdapter): {e}"),
@@ -704,6 +717,65 @@ mod tests {
         assert!(
             TileSpec::new([0, 4, 4], grid.dims()).is_err(),
             "TileSpec::new must reject a zero tile dimension"
+        );
+    }
+
+    /// The dense path must voxelize n=512: with tile `[4,4,4]` that is 128³ ≈ 2.1M
+    /// tiles ⇒ far more workgroups than the 65,535 per-dimension dispatch limit.
+    /// Before the 3-D dispatch this returned `WorkgroupsExceeded`; now it must run.
+    /// The fixture is a planar triangle at z≈250 spanning most of x/y, so its
+    /// occupied voxels live in HIGH linear-index tiles (≈1.0M) — dispatched at
+    /// `wg_id.y > 0`, directly exercising the shader's `wg_id` linearization. A
+    /// thin AABB keeps the CPU oracle cheap. The result must be a conservative
+    /// superset of the oracle: no CPU-marked voxel may be missing (which would
+    /// mean a high-index tile was skipped/mismapped by the chunked dispatch).
+    #[test]
+    fn dense_n512_dispatches_via_3d_chunking() {
+        let Some(gpu) = gpu_or_skip() else {
+            return;
+        };
+        let grid = grid_n(512);
+        let tiles = TileSpec::new([4, 4, 4], grid.dims()).unwrap();
+        let opts = VoxelizeOpts {
+            epsilon: 1e-4,
+            store_owner: false,
+            store_color: false,
+        };
+        let mesh = MeshInput {
+            triangles: vec![[
+                Vec3::new(10.0, 10.0, 250.0),
+                Vec3::new(500.0, 30.0, 250.0),
+                Vec3::new(30.0, 500.0, 250.0),
+            ]],
+            material_ids: None,
+        };
+
+        let gpu_out = pollster::block_on(gpu.voxelize_surface(&mesh, &grid, &tiles, &opts))
+            .expect("n=512 must dispatch via 3-D workgroup chunking, not exceed the per-dim limit");
+        let cpu_out = voxelize_surface_cpu(&mesh, &grid, &tiles, &opts);
+
+        let cpu_count = cpu_out.occupancy.count_occupied();
+        assert!(
+            cpu_count > 1000,
+            "planar fixture should mark many high-index-tile voxels (got {cpu_count})"
+        );
+
+        let cpu_w = cpu_out.occupancy.words();
+        let gpu_w = gpu_out.occupancy.words();
+        assert_eq!(cpu_w.len(), gpu_w.len());
+        let mut under = 0u64; // CPU-marked but GPU-missed — must be 0
+        let mut over = 0u64; // GPU over-marked — a small FP-tangent margin only
+        for (c, g) in cpu_w.iter().zip(gpu_w) {
+            under += u64::from((c & !g).count_ones());
+            over += u64::from((g & !c).count_ones());
+        }
+        assert_eq!(
+            under, 0,
+            "chunked dispatch under-marked {under} voxels — a high-index tile was skipped/mismapped"
+        );
+        assert!(
+            over * 50 < cpu_count,
+            "GPU over-marked {over} vs {cpu_count} CPU — beyond a small FP-tangent margin"
         );
     }
 }

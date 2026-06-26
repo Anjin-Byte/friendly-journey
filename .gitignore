@@ -11,3 +11,10 @@
 
 # Symlinked engineering standards vault (see CLAUDE.md / README).
 Engineering_Codex
+
+# Vendored external clones — each is its own git repo (STBN blue noise, XeGTAO
+# reference, OIDN denoiser source), not part of this repo's history. They were
+# tracked as accidental gitlinks; ignored here after `git rm --cached`.
+/STBN/
+/XeGTAO/
+/oidn/

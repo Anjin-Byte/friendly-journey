@@ -16,6 +16,7 @@ repository = "https://github.com/Anjin-Byte/friendly-journey"
 # Internal crates (path deps; the dependency graph runs inward toward voxel-core).
 voxel-core = { path = "crates/voxel-core" }
 voxel-gpu = { path = "crates/voxel-gpu" }
+voxelizer = { path = "crates/voxelizer" }
 
 # Shared external deps. Pinned here so members stay uniform; wgpu/winit are
 # version-churny and MUST be pinned centrally (adversarial review R6).
@@ -31,6 +32,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 radsort = "0.1"
+gltf = "1.4"
+tobj = "4"
+stl_io = "0.11"
 
 # Lints are centralized in the root manifest; every member inherits via
 # `[lints] workspace = true` (Engineering Codex: Workspace Lints and Profiles).

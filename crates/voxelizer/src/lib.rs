@@ -16,6 +16,9 @@
 //!   triangles (compressed sparse row).
 //! - [`gpu`] — the `wgpu` compute pipeline ([`GpuVoxelizer`]).
 //! - [`reference_cpu`] — the CPU SAT reference voxelizer used as a test oracle.
+//! - [`loader`] — input adapters that read external mesh formats into
+//!   [`MeshInput`] (glTF/GLB, OBJ, and STL), behind one [`load_mesh`]
+//!   dispatcher. Gated behind the `gltf` / `obj` / `stl` cargo features.
 
 // GPU index / dimension arithmetic converts freely between integer widths and
 // `f32`/`f64` for workgroup, brick, and voxel counts; these conversions are
@@ -32,6 +35,8 @@ pub mod core;
 pub mod csr;
 pub mod error;
 pub mod gpu;
+#[cfg(any(feature = "gltf", feature = "obj", feature = "stl"))]
+pub mod loader;
 pub mod reference_cpu;
 
 pub use crate::core::{
@@ -40,6 +45,14 @@ pub use crate::core::{
 };
 pub use crate::error::{VoxelizeGpuError, VoxelizerError};
 pub use crate::gpu::{GpuVoxelizer, GpuVoxelizerConfig};
+#[cfg(any(feature = "gltf", feature = "obj", feature = "stl"))]
+pub use crate::loader::load_mesh;
+#[cfg(feature = "gltf")]
+pub use crate::loader::{load_gltf_path, load_gltf_slice};
+#[cfg(feature = "obj")]
+pub use crate::loader::{load_obj_path, load_obj_slice};
+#[cfg(feature = "stl")]
+pub use crate::loader::{load_stl_path, load_stl_slice};
 
 // The `voxel-core` types that appear in this crate's public API, re-exported so
 // callers (and the renderer bridge) need not depend on `voxel-core` directly.

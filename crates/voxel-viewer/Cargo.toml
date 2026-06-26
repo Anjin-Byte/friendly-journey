@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 voxel-core = { workspace = true }
 voxel-gpu = { workspace = true }
+voxelizer = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 glam = { workspace = true }

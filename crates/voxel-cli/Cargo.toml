@@ -14,9 +14,11 @@ path = "src/main.rs"
 [dependencies]
 voxel-core = { workspace = true }
 voxel-gpu = { workspace = true }
+voxelizer = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 glam = { workspace = true }
+pollster = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

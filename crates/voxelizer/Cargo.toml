@@ -7,6 +7,16 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+# Default-on so plain `cargo test`/`clippy` exercise both input adapters, but
+# the heavy parsing dependencies are droppable via `--no-default-features` (the
+# `loader` module gates out entirely). Each format gates its own optional dep,
+# so `--features obj` (no glTF) and vice versa both compile independently.
+default = ["gltf", "obj", "stl"]
+gltf = ["dep:gltf"]
+obj = ["dep:tobj"]
+stl = ["dep:stl_io"]
+
 [dependencies]
 voxel-core = { workspace = true }
 bytemuck = { workspace = true }
@@ -14,6 +24,9 @@ glam = { workspace = true }
 wgpu = { workspace = true }
 thiserror = { workspace = true }
 pollster = { workspace = true }
+gltf = { workspace = true, optional = true }
+tobj = { workspace = true, optional = true }
+stl_io = { workspace = true, optional = true }
 
 # Browser console logging for the wasm32 debug path (csr.rs). Native/macOS builds
 # do not pull this in.

@@ -49,8 +49,10 @@ mod params {
         pub(crate) store_color: u32,
         /// Non-zero to accumulate debug counters into the debug buffer.
         pub(crate) debug: u32,
-        /// Padding to the next 16-byte boundary.
-        pub(crate) _pad0: [u32; 2],
+        /// The dispatch's x and y workgroup extents, so the shader can linearize a
+        /// 3-D `wg_id` back to a flat tile index (a dense grid can need more tiles
+        /// than the per-dimension dispatch limit). `[0, 0]` for 1-D dispatches.
+        pub(crate) dispatch_xy: [u32; 2],
     }
 }
 
@@ -127,8 +129,6 @@ pub(crate) struct CompactVoxelsParams {
 /// Supports both dense voxelization (full grid) and sparse voxelization
 /// (brick-based, only allocating storage for occupied regions).
 pub struct GpuVoxelizer {
-    pub(crate) instance: wgpu::Instance,
-    pub(crate) adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) pipeline: wgpu::ComputePipeline,
@@ -163,17 +163,19 @@ pub struct GpuLimitsSummary {
 }
 
 impl GpuVoxelizer {
-    /// Creates a new GPU voxelizer with the given configuration.
-    pub async fn new(config: GpuVoxelizerConfig) -> Result<Self, VoxelizeGpuError> {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .map_err(|_| VoxelizeGpuError::NoAdapter)?;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await?;
+    /// Builds a voxelizer on an existing device + queue (dependency injection),
+    /// so it can share a single GPU with the renderer (`voxel-gpu`) instead of
+    /// creating a second device. The composition root creates the device once
+    /// (e.g. via `voxel-gpu`'s `GpuContext`) and injects its handles into both
+    /// adapters. Prefer this when a process voxelizes *and* renders — it avoids a
+    /// duplicate device and lets output be handed to the renderer on the same GPU.
+    pub async fn from_device(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: GpuVoxelizerConfig,
+    ) -> Result<Self, VoxelizeGpuError> {
+        let device = device.clone();
+        let queue = queue.clone();
 
         let limits = device.limits();
         let max_invocations = limits.max_compute_invocations_per_workgroup;
@@ -192,8 +194,6 @@ impl GpuVoxelizer {
         let pipelines = create_pipelines(&device, workgroup_size, tiles_per_workgroup).await?;
 
         Ok(Self {
-            instance,
-            adapter,
             device,
             queue,
             pipeline: pipelines.pipeline,
@@ -215,14 +215,20 @@ impl GpuVoxelizer {
         })
     }
 
-    /// Returns the wgpu instance.
-    pub fn instance(&self) -> &wgpu::Instance {
-        &self.instance
-    }
-
-    /// Returns the wgpu adapter.
-    pub fn adapter(&self) -> &wgpu::Adapter {
-        &self.adapter
+    /// Creates a voxelizer that owns its own wgpu device — convenient for
+    /// standalone / headless use (CLI voxelize-only, tests). When voxelizing *and*
+    /// rendering in one process, prefer [`from_device`](Self::from_device) to share
+    /// a single GPU device with the renderer.
+    pub async fn new_standalone(config: GpuVoxelizerConfig) -> Result<Self, VoxelizeGpuError> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .map_err(|_| VoxelizeGpuError::NoAdapter)?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await?;
+        Self::from_device(&device, &queue, config).await
     }
 
     /// Returns the wgpu device.
@@ -269,6 +275,22 @@ impl GpuVoxelizer {
             });
         }
         Ok(())
+    }
+
+    /// Factors a flat workgroup count into a 3-D dispatch whose every dimension is
+    /// within `max_compute_workgroups_per_dimension`, so a dense grid with more
+    /// tiles than the per-dimension limit dispatches in one pass (the shader
+    /// linearizes `wg_id` back to the flat index). `x * y * z >= workgroups`;
+    /// surplus workgroups are guarded by the shader's `tile_index < num_tiles`.
+    /// `z` exceeds the limit only for an astronomically large grid — the caller
+    /// rejects that case.
+    pub(crate) fn dense_workgroup_dims(&self, workgroups: u32) -> (u32, u32, u32) {
+        let max = self.max_compute_workgroups_per_dimension.max(1);
+        let x = workgroups.min(max).max(1);
+        let rem = workgroups.div_ceil(x);
+        let y = rem.min(max).max(1);
+        let z = rem.div_ceil(y).max(1);
+        (x, y, z)
     }
 
     /// Validates that a buffer size fits within device limits.
@@ -430,5 +452,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `from_device` builds a working voxelizer on an externally-created device,
+    /// and two voxelizers can share ONE device — the point of the injection
+    /// interface (renderer + voxelizer on a single GPU). GPU-gated.
+    #[test]
+    fn from_device_shares_one_injected_device() {
+        use crate::core::{MeshInput, TileSpec, VoxelGrid, VoxelizeOpts};
+        use crate::gpu::GpuVoxelizer;
+        use crate::reference_cpu::voxelize_surface_cpu;
+        use glam::Vec3;
+        use voxel_core::Resolution;
+
+        // Create ONE device the way a host (e.g. voxel-gpu's GpuContext) would.
+        let made = pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .ok()?;
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .ok()?;
+            Some((device, queue))
+        });
+        let Some((device, queue)) = made else {
+            return; // no adapter — skip
+        };
+
+        // Two voxelizers injected with the SAME device + queue (one shared GPU).
+        let vox = pollster::block_on(GpuVoxelizer::from_device(
+            &device,
+            &queue,
+            GpuVoxelizerConfig::default(),
+        ))
+        .expect("from_device on a shared device");
+        let _second = pollster::block_on(GpuVoxelizer::from_device(
+            &device,
+            &queue,
+            GpuVoxelizerConfig::default(),
+        ))
+        .expect("a second voxelizer can share the same device");
+
+        let grid = VoxelGrid::new(Resolution::new(8).unwrap(), Vec3::ZERO, 1.0);
+        let tiles = TileSpec::new([2, 2, 2], grid.dims()).unwrap();
+        let opts = VoxelizeOpts::default();
+        let mesh = MeshInput {
+            triangles: vec![[
+                Vec3::new(1.5, 1.5, 1.5),
+                Vec3::new(6.0, 2.0, 2.0),
+                Vec3::new(2.0, 6.0, 3.0),
+            ]],
+            material_ids: None,
+        };
+        let out = pollster::block_on(vox.voxelize_surface(&mesh, &grid, &tiles, &opts))
+            .expect("voxelize on an injected device");
+        let cpu = voxelize_surface_cpu(&mesh, &grid, &tiles, &opts);
+
+        assert!(
+            out.occupancy.count_occupied() > 0,
+            "the injected-device voxelizer must produce occupancy"
+        );
+        // GPU ⊇ CPU (never under-marks) — the same tolerant contract as the differential.
+        let under: u32 = cpu
+            .occupancy
+            .words()
+            .iter()
+            .zip(out.occupancy.words())
+            .map(|(c, g)| (c & !g).count_ones())
+            .sum();
+        assert_eq!(
+            under, 0,
+            "injected-device voxelizer under-marked vs the CPU oracle"
+        );
     }
 }

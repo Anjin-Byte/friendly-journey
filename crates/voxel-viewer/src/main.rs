@@ -25,6 +25,7 @@ mod camera;
 mod hud;
 mod input;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,6 +37,8 @@ use voxel_core::{
     Edit, Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, brush_voxels, traverse,
 };
 use voxel_gpu::{GpuCamera, GpuContext, GpuRenderer};
+use voxelizer::loader::load_mesh;
+use voxelizer::{GpuVoxelizer, GpuVoxelizerConfig, TileSpec, VoxelGrid, VoxelizeOpts};
 use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -49,7 +52,7 @@ use camera::{FlyCamera, orbit_camera, orbit_eye_forward};
 use hud::{Hud, HudBuilder};
 use input::Input;
 
-#[derive(Parser, Clone, Copy)]
+#[derive(Parser, Clone)]
 #[command(
     name = "voxel-viewer",
     about = "Render the sparse MIP voxel structure on the GPU"
@@ -64,9 +67,17 @@ struct Args {
     /// Window height in pixels.
     #[arg(long, default_value_t = 600)]
     height: u32,
-    /// Occupancy fixture to render.
+    /// Occupancy fixture to render (used when `--mesh` is not given).
     #[arg(long, value_enum, default_value_t = Fixture::Sierpinski)]
     fixture: Fixture,
+    /// Mesh file to voxelize and render (`.gltf`/`.glb`, `.obj`, `.stl`). When
+    /// set, the mesh is voxelized into the grid instead of building `--fixture`.
+    #[arg(long)]
+    mesh: Option<PathBuf>,
+    /// Voxels of margin around the mesh's bounding box when fitting it into the
+    /// grid (only used with `--mesh`).
+    #[arg(long, default_value_t = 2.0)]
+    padding: f32,
     /// Cap the frame rate to the display refresh (off by default, so the
     /// profile reflects raw GPU throughput).
     #[arg(long)]
@@ -145,7 +156,7 @@ struct App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
-            match Viewer::new(event_loop, self.args) {
+            match Viewer::new(event_loop, &self.args) {
                 Ok(v) => self.state = Some(v),
                 Err(e) => {
                     eprintln!("viewer init failed: {e:?}");
@@ -227,7 +238,8 @@ struct Viewer {
     hud: Hud,
     show_hud: bool,
     resolution: Resolution,
-    fixture: Fixture,
+    /// HUD label for the current scene: the fixture name, or the mesh filename.
+    scene_label: String,
     node_count: usize,
     leaf_count: usize,
     // Editing: the live tree + its School-B buffer, kept CPU-side so an edit can
@@ -264,7 +276,7 @@ impl Viewer {
     // Inherently long: one-shot setup of window, surface, adapter, device,
     // structure, render pipeline, blit pipeline, and HUD.
     #[allow(clippy::too_many_lines)]
-    fn new(event_loop: &ActiveEventLoop, args: Args) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, args: &Args) -> Result<Self> {
         let attrs = Window::default_attributes()
             .with_title("voxel-viewer — sparse MIP HDDA on the GPU")
             .with_inner_size(winit::dpi::LogicalSize::new(args.width, args.height));
@@ -321,13 +333,38 @@ impl Viewer {
         };
         surface.configure(&device, &config);
 
-        // Build the structure. Noise fixtures generate their occupancy on the GPU
-        // (≈17× faster than the parallel CPU build at 512³); the tree is kept
-        // alongside its buffer so edits can patch both.
+        // Build the structure: either voxelize a mesh file (sharing this GPU via
+        // `from_device`) or generate the chosen fixture. Noise fixtures generate
+        // their occupancy on the GPU (≈17× faster than the CPU build at 512³); the
+        // tree is kept alongside its buffer so edits can patch both.
         let ctx = GpuContext { device, queue };
         let resolution = Resolution::new(args.res)?;
-        eprintln!("building {}³ structure…", resolution.voxels_per_axis());
-        let (tree, structure) = build_structure(&ctx, resolution, args.fixture);
+        let (scene_label, (tree, structure)) = if let Some(mesh_path) = args.mesh.as_deref() {
+            let label = mesh_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("MESH")
+                .to_string();
+            eprintln!(
+                "voxelizing {} into a {}³ grid…",
+                mesh_path.display(),
+                resolution.voxels_per_axis()
+            );
+            (
+                label,
+                build_from_mesh(&ctx, resolution, mesh_path, args.padding)?,
+            )
+        } else {
+            eprintln!(
+                "building {}³ {} structure…",
+                resolution.voxels_per_axis(),
+                args.fixture.label()
+            );
+            (
+                args.fixture.label().to_string(),
+                build_structure(&ctx, resolution, args.fixture),
+            )
+        };
         let (node_count, leaf_count) = (tree.node_count(), tree.leaf_count());
 
         let renderer = GpuRenderer::new(&ctx, &structure)?;
@@ -363,7 +400,7 @@ impl Viewer {
             hud,
             show_hud: true,
             resolution,
-            fixture: args.fixture,
+            scene_label,
             node_count,
             leaf_count,
             tree,
@@ -754,7 +791,7 @@ impl Viewer {
 
         let header = format!(
             "{} {}^3",
-            self.fixture.label(),
+            self.scene_label,
             self.resolution.voxels_per_axis()
         );
         let stats = [
@@ -819,6 +856,37 @@ impl Viewer {
         );
         b
     }
+}
+
+/// Voxelizes a mesh file into the sparse structure, sharing the viewer's GPU
+/// device via [`GpuVoxelizer::from_device`] (one device for both voxelizing and
+/// rendering). Returns the live tree + its School-B buffer, like
+/// [`build_structure`]. Occupancy-only (the renderer needs no per-voxel
+/// material), so even a 512³ grid stays within the storage limit.
+fn build_from_mesh(
+    ctx: &GpuContext,
+    resolution: Resolution,
+    path: &Path,
+    padding: f32,
+) -> Result<(SparseTree, SchoolBBuffer)> {
+    let mesh = load_mesh(path).with_context(|| format!("loading mesh {}", path.display()))?;
+    eprintln!("  {} triangles", mesh.triangles.len());
+    let grid = VoxelGrid::fit_mesh(resolution, &mesh, padding);
+    let tiles = TileSpec::new([4, 4, 4], grid.dims())?;
+    let opts = VoxelizeOpts {
+        epsilon: 1e-4,
+        store_owner: false,
+        store_color: false,
+    };
+    let vox = pollster::block_on(GpuVoxelizer::from_device(
+        &ctx.device,
+        &ctx.queue,
+        GpuVoxelizerConfig::default(),
+    ))?;
+    let out = pollster::block_on(vox.voxelize_surface(&mesh, &grid, &tiles, &opts))?;
+    let tree = out.occupancy.to_sparse_tree();
+    let structure = SchoolBBuffer::from_sparse(&tree);
+    Ok((tree, structure))
 }
 
 /// Builds the [`SparseTree`] for a noise fixture, evaluating the occupancy on the

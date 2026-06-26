@@ -71,6 +71,13 @@ pub enum VoxelizerError {
     /// subnormal), which would make the derived world→grid matrix non-finite.
     #[error("voxel_size {0} is too small: its reciprocal is not finite")]
     VoxelSizeTooSmall(f32),
+
+    /// An input adapter (e.g. the glTF loader) failed to parse, read, or
+    /// validate a source mesh. Carries the underlying cause as a `String` so
+    /// this enum stays `Clone`/`PartialEq` (the upstream error types are not),
+    /// mapped via `.to_string()` at the boundary.
+    #[error("failed to load mesh: {0}")]
+    MeshLoad(String),
 }
 
 /// Errors from the GPU boundary: adapter probing, dispatch limits, buffer

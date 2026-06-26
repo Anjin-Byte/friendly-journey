@@ -9,7 +9,7 @@ struct Params {
   store_owner: u32,
   store_color: u32,
   debug: u32,
-  _pad0: vec2<u32>,
+  dispatch_xy: vec2<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> tris: array<vec4<f32>>;
@@ -107,7 +107,13 @@ fn triangle_box_overlap(center: vec3<f32>, half: vec3<f32>, a: vec3<f32>, b: vec
 @compute @workgroup_size(WORKGROUP_SIZE, TILES_PER_WORKGROUP, 1)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let tile_lane = lid.y;
-  let tile_index = wg_id.x * TILES_PER_WORKGROUP + tile_lane;
+  // Linearize the (possibly 3-D) workgroup id back to a flat workgroup index so a
+  // dense grid with more tiles than the per-dimension dispatch limit still maps
+  // correctly. dispatch_xy = the dispatch's x,y extents; for a 1-D dispatch
+  // (sparse / small dense) wg_id.y = wg_id.z = 0, so this reduces to wg_id.x.
+  let linear_wg = wg_id.x + wg_id.y * params.dispatch_xy.x
+    + wg_id.z * params.dispatch_xy.x * params.dispatch_xy.y;
+  let tile_index = linear_wg * TILES_PER_WORKGROUP + tile_lane;
   let valid_tile = tile_index < params.num_tiles;
   if (lid.x == 0u && valid_tile && params.debug != 0u) {
     atomicAdd(&debug_counts[0], 1u);

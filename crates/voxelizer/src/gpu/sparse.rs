@@ -475,7 +475,8 @@ impl GpuVoxelizer {
             store_owner: u32::from(opts.store_owner),
             store_color: u32::from(opts.store_color),
             debug: 1,
-            _pad0: [0, 0],
+            // 1-D brick dispatch → no wg_id linearization needed.
+            dispatch_xy: [0, 0],
         };
 
         self.device
@@ -669,7 +670,7 @@ mod tests {
     use crate::gpu::{GpuVoxelizer, GpuVoxelizerConfig};
 
     fn gpu_or_skip() -> Option<GpuVoxelizer> {
-        match pollster::block_on(GpuVoxelizer::new(GpuVoxelizerConfig::default())) {
+        match pollster::block_on(GpuVoxelizer::new_standalone(GpuVoxelizerConfig::default())) {
             Ok(v) => Some(v),
             Err(VoxelizeGpuError::NoAdapter) => None,
             Err(e) => panic!("GPU init failed (not NoAdapter): {e}"),

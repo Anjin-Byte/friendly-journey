@@ -51,7 +51,7 @@ fn test_tiles(grid: &VoxelGrid) -> TileSpec {
 /// Probes for a GPU; returns `None` (and skips) when no adapter is present, but
 /// panics on any *other* init failure so a real regression is not silently hidden.
 fn gpu_or_skip() -> Option<GpuVoxelizer> {
-    match pollster::block_on(GpuVoxelizer::new(GpuVoxelizerConfig::default())) {
+    match pollster::block_on(GpuVoxelizer::new_standalone(GpuVoxelizerConfig::default())) {
         Ok(v) => Some(v),
         Err(VoxelizeGpuError::NoAdapter) => {
             eprintln!("no GPU adapter present — skipping GPU differential test");
