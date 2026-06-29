@@ -389,6 +389,8 @@ mod tests {
                 ],
             ],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let csr = build_tile_csr(&mesh, &grid, &tiles, 1e-4);
         assert_eq!(csr.tile_offsets[0], 0);
@@ -449,6 +451,8 @@ mod tests {
                 Vec3::new(-10.0, -8.0, -10.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let csr = build_brick_csr(&mesh, &grid, 4, 1e-4);
         assert!(
@@ -474,6 +478,8 @@ mod tests {
                 Vec3::new(20.0, 22.0, 20.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let csr = build_brick_csr(&mesh, &grid, 4, 1e-4);
         assert!(
@@ -500,6 +506,8 @@ mod tests {
                 Vec3::new(6.0, 12.0, 6.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let brick_dim = 4u32;
         let csr = build_brick_csr(&mesh, &grid, brick_dim, 1e-4);

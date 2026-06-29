@@ -46,9 +46,44 @@ pub enum VoxelizerError {
         tris: usize,
     },
 
+    /// The `uvs` length did not match the triangle count.
+    #[error("uvs length ({uvs}) must match triangles length ({tris})")]
+    UvLenMismatch {
+        /// Number of supplied per-triangle UVs.
+        uvs: usize,
+        /// Number of triangles.
+        tris: usize,
+    },
+
+    /// The mesh has more distinct materials than fit the global table. Ids are
+    /// dense from 1 with id 0 reserved for the magenta MISSING sentinel, so at
+    /// most 65535 real materials fit (ids `1..=u16::MAX`).
+    #[error(
+        "mesh has more than 65535 distinct materials (id 0 reserved magenta; real ids are 1..=u16::MAX)"
+    )]
+    TooManyMaterials,
+
     /// A triangle contained a non-finite vertex.
     #[error("triangle contains a non-finite vertex")]
     NonFiniteVertex,
+
+    /// A per-triangle UV coordinate was non-finite (NaN/Inf). Left unchecked it
+    /// would sample a garbage texel (or a wrong wrapped texel) during the bake.
+    #[error("triangle contains a non-finite UV coordinate")]
+    NonFiniteUv,
+
+    /// A base-colour texture violated its invariant: a zero dimension, or an
+    /// `rgba` length that does not equal `width * height`. Rejected at
+    /// construction so the sampling primitives never index out of bounds.
+    #[error("malformed texture: {width}x{height} declares {} texels but rgba has {len}", (*width as usize).saturating_mul(*height as usize))]
+    MalformedTexture {
+        /// Declared width in texels.
+        width: u32,
+        /// Declared height in texels.
+        height: u32,
+        /// Actual number of RGBA texels supplied.
+        len: usize,
+    },
 
     /// A wrapped occupancy word buffer was shorter than `ceil(n³/32)`.
     #[error("occupancy word buffer too small: got {got} words, need {need}")]

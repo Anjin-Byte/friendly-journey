@@ -13,7 +13,7 @@ FIXTURE ?= dust
 RES     ?= 512
 ITERS   ?= 5000
 RAYS    ?= 20000
-MESH    ?= models/littlest-tokyo.obj
+MESH    ?= models/gltf/LittlestTokyo.glb
 # Corrective X rotation for the default OBJ (authored Z-up; this viewer is Y-up).
 ROT_X   ?= -90
 
@@ -61,7 +61,7 @@ viewer: ## run the viewer (FIXTURE, RES); right-click edits, B / [ ] brush
 
 .PHONY: mesh
 mesh: ## voxelize + view a mesh file (MESH, RES, ROT_X; gltf/glb/obj/stl)
-	cargo run --release -p voxel-viewer -- --mesh $(MESH) --res $(RES) --rotate-x $(ROT_X)
+	cargo run --release -p voxel-viewer -- --mesh $(MESH) --res $(RES) --truecolor
 
 ## --- headless measurements (FIXTURE, RES) ---
 

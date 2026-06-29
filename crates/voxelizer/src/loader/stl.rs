@@ -64,10 +64,11 @@ fn indexed_mesh_to_input(mesh: &stl_io::IndexedMesh) -> Result<MeshInput, Voxeli
     }
 
     let mesh = MeshInput {
-        // STL has no material concept; `None` is honest and valid (no fabricated
-        // ids).
+        // STL has no material/UV concept; `None` is honest and valid.
         triangles,
         material_ids: None,
+        uvs: None,
+        appearance: None,
     };
     // Surfaces a non-finite vertex as MeshLoad rather than panicking downstream.
     mesh.validate()

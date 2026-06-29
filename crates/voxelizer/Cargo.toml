@@ -14,7 +14,7 @@ repository.workspace = true
 # so `--features obj` (no glTF) and vice versa both compile independently.
 default = ["gltf", "obj", "stl"]
 gltf = ["dep:gltf"]
-obj = ["dep:tobj"]
+obj = ["dep:tobj", "dep:image"]
 stl = ["dep:stl_io"]
 
 [dependencies]
@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 pollster = { workspace = true }
 gltf = { workspace = true, optional = true }
 tobj = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 stl_io = { workspace = true, optional = true }
 
 # Browser console logging for the wasm32 debug path (csr.rs). Native/macOS builds

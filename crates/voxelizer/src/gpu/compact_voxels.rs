@@ -312,7 +312,18 @@ impl GpuVoxelizer {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
         let counter = map_buffer_u32(&read_counter, &self.device)?;
-        Ok(counter.first().copied().unwrap_or(0).min(max_entries))
+        let raw = counter.first().copied().unwrap_or(0);
+        // Tripwire (docs/materials/09 step 2): the shader emits one voxel per
+        // occupied bit, so its count must not exceed `max_entries` (the host
+        // occupancy popcount the output buffer is sized for). A raw count ABOVE it
+        // means the `.min` below silently dropped voxels — an occupancy/owner
+        // desync. Structurally impossible today, but guard loudly so a future
+        // regression is not a silent, incomplete tree.
+        debug_assert!(
+            raw <= max_entries,
+            "compact_voxels truncated: shader emitted {raw} voxels > max_entries {max_entries}"
+        );
+        Ok(raw.min(max_entries))
     }
 }
 

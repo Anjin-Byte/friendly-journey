@@ -9,9 +9,10 @@
 //! as auxiliary material outputs (not yet consumed by the renderer).
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use voxel_core::{OccupancyField, Resolution, SchoolBBuffer, SparseTree, VoxelCoord};
 
+use crate::bake::{AlphaMode, Texture, WrapMode};
 use crate::error::VoxelizerError;
 
 /// A cubic voxel grid: a [`Resolution`]-sized lattice (`n³`, `n = 8·4^k`) placed
@@ -311,13 +312,60 @@ impl TileSpec {
     }
 }
 
-/// A triangle-soup mesh in world space, with optional per-triangle material ids.
+/// One material's base-colour appearance: an optional sRGB texture (an index into
+/// [`MeshAppearance::textures`]), the **linear** base-colour tint, and the
+/// sampler's wrap modes. Indexed by `material_id`.
 #[derive(Debug, Clone)]
+pub struct MaterialDef {
+    /// The source material name (glTF `material.name`, MTL `newmtl`), lower-cased
+    /// matching is used to spot toon **outline** hulls in [`MeshInput::drop_outline_triangles`].
+    /// `None` for unnamed materials.
+    pub name: Option<String>,
+    /// Index into [`MeshAppearance::textures`], or `None` for an untextured
+    /// (flat `base_color_factor`) material.
+    pub base_color_texture: Option<usize>,
+    /// Linear `base_color_factor` tint (multiplies the sampled texel).
+    pub base_color_factor: [f32; 4],
+    /// Wrap mode for the U axis.
+    pub wrap_s: WrapMode,
+    /// Wrap mode for the V axis.
+    pub wrap_t: WrapMode,
+    /// glTF `alphaMode` (OBJ/STL default `Opaque`). MASK voxels below
+    /// [`alpha_cutoff`](Self::alpha_cutoff) are cut at bake time.
+    pub alpha_mode: AlphaMode,
+    /// glTF `alphaCutoff` (default `0.5`); only meaningful for `alpha_mode == Mask`.
+    pub alpha_cutoff: f32,
+}
+
+/// A mesh's base-colour appearance: the decoded textures plus one [`MaterialDef`]
+/// per `material_id`. Carried alongside the geometry so the per-voxel texture bake
+/// (`docs/materials/11`) can resolve `triangle → material → texture + UV → texel`.
+#[derive(Debug, Clone)]
+pub struct MeshAppearance {
+    /// Decoded sRGB base-colour textures, indexed by [`MaterialDef::base_color_texture`].
+    pub textures: Vec<Texture>,
+    /// Per-`material_id` appearance.
+    pub materials: Vec<MaterialDef>,
+}
+
+/// A triangle-soup mesh in world space, with optional per-triangle material ids,
+/// UVs, and base-colour appearance (textures) for per-voxel baking.
+///
+/// Derives [`Default`] (empty mesh: no triangles, no ids/uvs/appearance) so test
+/// and external constructors can use `MeshInput { triangles, ..Default::default() }`
+/// and stay source-compatible when new optional fields are added.
+#[derive(Debug, Clone, Default)]
 pub struct MeshInput {
     /// World-space triangles (three vertices each).
     pub triangles: Vec<[Vec3; 3]>,
     /// Optional per-triangle material id (length must match `triangles`).
     pub material_ids: Option<Vec<u32>>,
+    /// Optional per-triangle base-colour UVs (the set the base-colour texture
+    /// references), aligned to `triangles`. `None` for formats/loaders without UVs.
+    pub uvs: Option<Vec<[Vec2; 3]>>,
+    /// Optional base-colour textures + per-material defs for the per-voxel bake.
+    /// `None` when the mesh carries no textures.
+    pub appearance: Option<MeshAppearance>,
 }
 
 impl MeshInput {
@@ -336,11 +384,82 @@ impl MeshInput {
         }
     }
 
-    /// Validates the mesh: material-id length matches, all vertices finite.
+    /// Drops triangles whose material is a toon **outline** hull. These are
+    /// inverted-hull silhouette tricks (e.g. `LittlestTokyo`'s "outline" material is
+    /// 37% of its triangles); a *surface* voxelizer can't back-face-cull them, so it
+    /// turns them into a solid black shell over the real geometry and the textured
+    /// surface underneath never shows.
+    ///
+    /// The signature is deliberately conservative — a material qualifies only if its
+    /// **name contains "outline"** (case-insensitive) AND it is untextured AND its
+    /// `base_color_factor` is dark (luminance < `0.1`). Name is load-bearing: a
+    /// near-black factor alone would also delete legitimate black walls, tyres, and
+    /// dark-coloured surfaces, so it is never sufficient by itself.
+    ///
+    /// Keeps `triangles`/`material_ids`/`uvs` aligned. Returns the number dropped (0
+    /// if there is no appearance/material map, or no material matches — the common
+    /// case, so a no-op for ordinary meshes).
+    pub fn drop_outline_triangles(&mut self) -> usize {
+        let keep: Vec<bool> = {
+            let (Some(app), Some(mat_ids)) = (self.appearance.as_ref(), self.material_ids.as_ref())
+            else {
+                return 0;
+            };
+            // An outline hull: named "outline", untextured, and dark. The name is
+            // required — darkness alone would catch real black/dark-coloured surfaces.
+            let is_outline: Vec<bool> = app
+                .materials
+                .iter()
+                .map(|m| {
+                    let named_outline = m
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| n.to_ascii_lowercase().contains("outline"));
+                    let f = m.base_color_factor;
+                    named_outline
+                        && m.base_color_texture.is_none()
+                        && 0.2126 * f[0] + 0.7152 * f[1] + 0.0722 * f[2] < 0.1
+                })
+                .collect();
+            mat_ids
+                .iter()
+                .map(|&id| {
+                    usize::try_from(id)
+                        .ok()
+                        .and_then(|i| is_outline.get(i))
+                        .copied()
+                        != Some(true)
+                })
+                .collect()
+        };
+        let dropped = keep.iter().filter(|&&k| !k).count();
+        if dropped == 0 {
+            return 0;
+        }
+        // `retain` visits in order, so a fresh iterator over `keep` stays aligned with
+        // each parallel array.
+        let mut it = keep.iter();
+        self.triangles.retain(|_| *it.next().unwrap());
+        if let Some(ids) = self.material_ids.as_mut() {
+            let mut it = keep.iter();
+            ids.retain(|_| *it.next().unwrap());
+        }
+        if let Some(uvs) = self.uvs.as_mut() {
+            let mut it = keep.iter();
+            uvs.retain(|_| *it.next().unwrap());
+        }
+        dropped
+    }
+
+    /// Validates the mesh: id/UV lengths match the triangle count, and every
+    /// vertex *and UV* is finite.
     ///
     /// # Errors
     /// Returns [`VoxelizerError::MaterialIdLenMismatch`] or
-    /// [`VoxelizerError::NonFiniteVertex`].
+    /// [`VoxelizerError::UvLenMismatch`] on a length mismatch, and
+    /// [`VoxelizerError::NonFiniteVertex`] / [`VoxelizerError::NonFiniteUv`] on a
+    /// non-finite position / texture coordinate (a non-finite UV would sample a
+    /// garbage texel in the bake, so it is rejected here at the boundary).
     pub fn validate(&self) -> Result<(), VoxelizerError> {
         if let Some(ids) = &self.material_ids {
             if ids.len() != self.triangles.len() {
@@ -348,6 +467,21 @@ impl MeshInput {
                     ids: ids.len(),
                     tris: self.triangles.len(),
                 });
+            }
+        }
+        if let Some(uvs) = &self.uvs {
+            if uvs.len() != self.triangles.len() {
+                return Err(VoxelizerError::UvLenMismatch {
+                    uvs: uvs.len(),
+                    tris: self.triangles.len(),
+                });
+            }
+            for tri_uv in uvs {
+                for uv in tri_uv {
+                    if !uv.is_finite() {
+                        return Err(VoxelizerError::NonFiniteUv);
+                    }
+                }
             }
         }
         for tri in &self.triangles {
@@ -482,6 +616,122 @@ mod tests {
         Resolution::new(8).unwrap()
     }
 
+    fn mat(name: Option<&str>, tex: Option<usize>, factor: [f32; 4]) -> MaterialDef {
+        MaterialDef {
+            name: name.map(str::to_owned),
+            base_color_texture: tex,
+            base_color_factor: factor,
+            wrap_s: WrapMode::Repeat,
+            wrap_t: WrapMode::Repeat,
+            alpha_mode: AlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+        }
+    }
+
+    #[test]
+    fn drop_outline_triangles_removes_only_the_named_outline_hull() {
+        let tri = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        // mat 0: textured surface. mat 1: the toon "outline" (untextured, near-black).
+        // mat 2: a legit pure-black wall — SAME darkness as the outline but NOT named
+        // "outline", so it must be KEPT (the false-positive guard the audit demanded).
+        let mut mesh = MeshInput {
+            triangles: vec![tri, tri, tri, tri],
+            material_ids: Some(vec![0, 1, 2, 1]),
+            uvs: Some(vec![[Vec2::ZERO; 3]; 4]),
+            appearance: Some(MeshAppearance {
+                textures: vec![],
+                materials: vec![
+                    mat(Some("paintmat"), Some(0), [1.0, 1.0, 1.0, 1.0]),
+                    mat(Some("outline"), None, [0.014, 0.009, 0.006, 1.0]),
+                    mat(Some("Wall_Black"), None, [0.0, 0.0, 0.0, 1.0]),
+                ],
+            }),
+        };
+        let dropped = mesh.drop_outline_triangles();
+        assert_eq!(dropped, 2, "both outline (mat 1) triangles dropped");
+        assert_eq!(mesh.triangles.len(), 2);
+        // Survivors are the textured wall (0) and the black wall (2) — never mat 1.
+        assert_eq!(mesh.material_ids.as_deref(), Some(&[0u32, 2][..]));
+        assert_eq!(mesh.uvs.as_ref().unwrap().len(), 2, "uvs stay aligned");
+    }
+
+    #[test]
+    fn drop_outline_keeps_dark_and_bright_non_outline_materials() {
+        let tri = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        // None of these are a dark, untextured, "outline"-named hull, so NONE drop:
+        // a bright material that happens to be named outline, a dark colored surface,
+        // and an unnamed near-black material (the loose old heuristic would have
+        // wrongly nuked the last two).
+        let mut mesh = MeshInput {
+            triangles: vec![tri, tri, tri],
+            material_ids: Some(vec![0, 1, 2]),
+            uvs: None,
+            appearance: Some(MeshAppearance {
+                textures: vec![],
+                materials: vec![
+                    mat(Some("outline_glow"), None, [1.0, 0.9, 0.2, 1.0]), // bright
+                    mat(Some("Cloth_Red"), None, [0.172, 0.009, 0.009, 1.0]), // dark red
+                    mat(None, None, [0.0, 0.0, 0.0, 1.0]),                 // unnamed black
+                ],
+            }),
+        };
+        assert_eq!(
+            mesh.drop_outline_triangles(),
+            0,
+            "nothing qualifies as outline"
+        );
+        assert_eq!(mesh.triangles.len(), 3);
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_uv() {
+        let tri = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        // Finite vertices but a NaN UV: previously slipped through validate and
+        // sampled a garbage texel in the bake. Must now be rejected.
+        let bad = MeshInput {
+            triangles: vec![tri],
+            material_ids: None,
+            uvs: Some(vec![[Vec2::new(f32::NAN, 0.0), Vec2::ZERO, Vec2::ZERO]]),
+            appearance: None,
+        };
+        assert_eq!(bad.validate(), Err(VoxelizerError::NonFiniteUv));
+
+        // An Inf UV is likewise rejected.
+        let inf = MeshInput {
+            triangles: vec![tri],
+            material_ids: None,
+            uvs: Some(vec![[
+                Vec2::ZERO,
+                Vec2::new(0.0, f32::INFINITY),
+                Vec2::ZERO,
+            ]]),
+            appearance: None,
+        };
+        assert_eq!(inf.validate(), Err(VoxelizerError::NonFiniteUv));
+
+        // The same triangle with finite UVs validates.
+        let good = MeshInput {
+            triangles: vec![tri],
+            material_ids: None,
+            uvs: Some(vec![[Vec2::ZERO; 3]]),
+            appearance: None,
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn drop_outline_triangles_is_a_noop_without_appearance() {
+        let tri = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        let mut mesh = MeshInput {
+            triangles: vec![tri],
+            material_ids: Some(vec![0]),
+            uvs: None,
+            appearance: None,
+        };
+        assert_eq!(mesh.drop_outline_triangles(), 0);
+        assert_eq!(mesh.triangles.len(), 1);
+    }
+
     #[test]
     fn is_occupied_on_undersized_buffer_returns_false() {
         // res 8 needs 16 words; give it just one. Reads past the end must be
@@ -588,6 +838,8 @@ mod tests {
                 Vec3::new(0.0, 1.0, 0.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         mesh.transform(Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2));
         let rotated = mesh.triangles[0][2];
@@ -608,6 +860,8 @@ mod tests {
         let mesh = MeshInput {
             triangles: Vec::new(),
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         for padding in [0.0_f32, 4.0] {
             let grid = VoxelGrid::fit_mesh(res8(), &mesh, padding);
@@ -633,6 +887,8 @@ mod tests {
                 Vec3::new(0.0, 4.0, 0.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         for padding in [4.0_f32, 8.0, 100.0] {
             let grid = VoxelGrid::fit_mesh(res8(), &mesh, padding);

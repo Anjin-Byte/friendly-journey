@@ -730,6 +730,8 @@ mod tests {
         let mesh = MeshInput {
             triangles: Vec::new(),
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let out = pollster::block_on(gpu.voxelize_surface_sparse(&mesh, &grid, &opts))
             .expect("empty mesh must produce an empty sparse output, not error");
@@ -768,6 +770,8 @@ mod tests {
                     ],
                 ],
                 material_ids: None,
+                uvs: None,
+                appearance: None,
             };
             let dense = pollster::block_on(gpu.voxelize_surface(&mesh, &grid, &tiles, &opts))
                 .expect("dense voxelize");
@@ -799,6 +803,8 @@ mod tests {
                 Vec3::new(-10.0, -8.0, -10.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let out = pollster::block_on(gpu.voxelize_surface_sparse(&mesh, &grid, &opts))
             .expect("outside-geometry mesh must not error");
@@ -829,6 +835,8 @@ mod tests {
                 Vec3::new(2.0, 6.0, 4.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let err =
             pollster::block_on(gpu.compact_surface_sparse(&mesh, &grid, &opts, &[], [0, 0, 0]))

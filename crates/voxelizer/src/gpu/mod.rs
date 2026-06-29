@@ -506,6 +506,8 @@ mod tests {
                 Vec3::new(2.0, 6.0, 3.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let out = pollster::block_on(vox.voxelize_surface(&mesh, &grid, &tiles, &opts))
             .expect("voxelize on an injected device");
@@ -601,6 +603,8 @@ mod tests {
                 ],
             ],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
 
         let cpu = voxelize_surface_cpu(&mesh, &grid, &tiles, &opts);

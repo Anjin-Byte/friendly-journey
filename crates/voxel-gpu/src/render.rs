@@ -9,7 +9,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use voxel_core::SchoolBBuffer;
+use voxel_core::{MaterialTable, NodeLayout, SchoolBBuffer};
 
 use crate::buffers;
 use crate::context::GpuContext;
@@ -55,6 +55,36 @@ struct RenderTiming {
     period: f32,
 }
 
+/// The per-scene shading mode, chosen by [`SchoolBBuffer::has_leaf_color`]. The
+/// two arms bind different buffers at slots 5..8 and compile a different entry
+/// shader; the palette arm is byte-identical to the pre-truecolor renderer.
+///
+/// The selection is a silent fallback by design: a scene with no baked colour —
+/// including an *empty* truecolor bake (zero occupied voxels) — routes to the
+/// palette arm rather than erroring.
+enum RenderMode {
+    /// Palette materials (`docs/materials/02-03`): `leaf_mat`@5 + `material_table`@6.
+    Palette {
+        /// Per-leaf packed material slots; `COPY_DST` for
+        /// [`update_leaf_mat`](GpuRenderer::update_leaf_mat).
+        leaf_mat_buf: wgpu::Buffer,
+        /// The global `global_id → colour` table; scene-static.
+        table_buf: wgpu::Buffer,
+    },
+    /// Per-voxel truecolor (`docs/materials/11`, P4): `leaf_color_base`@5 + N colour
+    /// chunks at 6..8 (build-once / static — edits must re-bake via [`new`]).
+    ///
+    /// [`new`]: GpuRenderer::new
+    Truecolor {
+        /// Per-leaf colour base offsets (prefix sum of `count_occupied`).
+        base_buf: wgpu::Buffer,
+        /// The `N = ceil(len / per_chunk)` physical colour sub-buffers.
+        chunks: Vec<wgpu::Buffer>,
+        /// One shared 1-`u32` buffer bound into the unused chunk slots `[N, N_MAX)`.
+        dummy_buf: wgpu::Buffer,
+    },
+}
+
 /// A compiled render pipeline with one uploaded structure.
 pub struct GpuRenderer {
     device: wgpu::Device,
@@ -64,6 +94,8 @@ pub struct GpuRenderer {
     node_buf: wgpu::Buffer,
     leaf_buf: wgpu::Buffer,
     bounds_buf: wgpu::Buffer,
+    /// The shading mode + its slot-5..8 buffers (palette vs truecolor).
+    mode: RenderMode,
     camera_buf: wgpu::Buffer,
     /// Max storage-buffer binding size, kept so [`reupload`](Self::reupload) can
     /// rebuild the structure buffers after a topology edit without the context.
@@ -71,9 +103,124 @@ pub struct GpuRenderer {
     timing: Option<RenderTiming>,
 }
 
+/// Builds the bind-group layout, entry-shader source, and slot-5..8 buffers for
+/// the scene's shading mode (truecolor when `structure.has_leaf_color()`, else
+/// palette). Bindings 0..4 are shared and added by the caller's layout list here.
+fn select_render_mode(
+    device: &wgpu::Device,
+    ctx: &GpuContext,
+    structure: &SchoolBBuffer,
+    table: &MaterialTable,
+    per_chunk: u32,
+    max_binding: u64,
+    output_entry: wgpu::BindGroupLayoutEntry,
+) -> Result<(wgpu::BindGroupLayout, String, RenderMode), GpuError> {
+    if structure.has_leaf_color() {
+        // Truecolor: the WGSL + layout hardcode N_MAX_CHUNKS chunk bindings.
+        debug_assert_eq!(
+            buffers::N_MAX_CHUNKS,
+            3,
+            "render_truecolor.wgsl + the layout below bind exactly 3 chunk slots"
+        );
+        // Probe device limits FIRST — a failure leaves no partial GPU state.
+        let n_res = structure.resolution().voxels_per_axis();
+        let len = structure.leaf_color_words().len();
+        let base_bytes = (structure.leaf_color_base_words().len() * 4) as u64;
+        buffers::probe_truecolor(
+            n_res,
+            len,
+            base_bytes,
+            per_chunk,
+            ctx.max_storage_buffers(),
+            max_binding,
+            ctx.max_buffer_size(),
+        )?;
+        let (chunks, base_buf, dummy_buf) = buffers::upload_color_chunks(
+            device,
+            structure.leaf_color_words(),
+            structure.leaf_color_base_words(),
+            per_chunk,
+        );
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("render layout (truecolor)"),
+            entries: &[
+                buffers::storage_entry(0, true), // nodes
+                buffers::storage_entry(1, true), // leaf_words
+                buffers::storage_entry(2, true), // leaf_bounds
+                buffers::uniform_entry(3),       // camera
+                output_entry,                    // output @4
+                buffers::storage_entry(5, true), // leaf_color_base
+                buffers::storage_entry(6, true), // leaf_color_0
+                buffers::storage_entry(7, true), // leaf_color_1
+                buffers::storage_entry(8, true), // leaf_color_2
+            ],
+        });
+        // Scene-time pipeline selection: a scene with transparent leaves compiles the
+        // front-to-back BLEND entry; otherwise the byte-identical opaque entry, so the
+        // opaque path never pays for compositing. Same 7-binding layout either way.
+        let source = if structure.has_transparency() {
+            buffers::color_blend_shader_source(per_chunk, buffers::MAX_BLEND)
+        } else {
+            buffers::color_shader_source(per_chunk)
+        };
+        Ok((
+            layout,
+            source,
+            RenderMode::Truecolor {
+                base_buf,
+                chunks,
+                dummy_buf,
+            },
+        ))
+    } else {
+        let (leaf_mat_buf, table_buf) =
+            buffers::upload_materials(device, structure, table, max_binding)?;
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("render layout"),
+            entries: &[
+                buffers::storage_entry(0, true), // nodes
+                buffers::storage_entry(1, true), // leaf_words
+                buffers::storage_entry(2, true), // leaf_bounds
+                buffers::uniform_entry(3),       // camera
+                output_entry,                    // output @4
+                buffers::storage_entry(5, true), // leaf_mat
+                buffers::storage_entry(6, true), // material_table
+            ],
+        });
+        Ok((
+            layout,
+            buffers::shader_source(include_str!("../shaders/render.wgsl")),
+            RenderMode::Palette {
+                leaf_mat_buf,
+                table_buf,
+            },
+        ))
+    }
+}
+
 impl GpuRenderer {
-    /// Compiles the render kernel and uploads `structure`.
-    pub fn new(ctx: &GpuContext, structure: &SchoolBBuffer) -> Result<Self, GpuError> {
+    /// Compiles the render kernel and uploads `structure` plus its material data
+    /// (`table` is the global `global_id → colour` table; pass
+    /// [`MaterialTable::missing_only`] when rendering occupancy-only fixtures —
+    /// the shader falls back to position shading for global-0).
+    pub fn new(
+        ctx: &GpuContext,
+        structure: &SchoolBBuffer,
+        table: &MaterialTable,
+    ) -> Result<Self, GpuError> {
+        Self::new_with_per_chunk(ctx, structure, table, buffers::COLOR_PER_CHUNK)
+    }
+
+    /// [`new`](Self::new) with an explicit colour-chunk size — for tests that force
+    /// a tiny `per_chunk` to drive the `N > 1` cross-chunk path on a small scene
+    /// (no 285 MiB of VRAM needed). Production calls [`new`](Self::new).
+    #[doc(hidden)]
+    pub fn new_with_per_chunk(
+        ctx: &GpuContext,
+        structure: &SchoolBBuffer,
+        table: &MaterialTable,
+        per_chunk: u32,
+    ) -> Result<Self, GpuError> {
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
 
@@ -86,32 +233,23 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // bindings 0..4 (nodes/leaf_words/leaf_bounds/camera/output) are shared by
+        // both modes; slots 5..8 and the entry shader differ.
+        let output_entry = buffers::storage_texture_entry(4, OUTPUT_FORMAT);
+
+        let (layout, shader_src, mode) = select_render_mode(
+            &device,
+            ctx,
+            structure,
+            table,
+            per_chunk,
+            max_binding,
+            output_entry,
+        )?;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
-            source: wgpu::ShaderSource::Wgsl(
-                buffers::shader_source(include_str!("../shaders/render.wgsl")).into(),
-            ),
-        });
-
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("render layout"),
-            entries: &[
-                buffers::storage_entry(0, true), // nodes
-                buffers::storage_entry(1, true), // leaf_words
-                buffers::storage_entry(2, true), // leaf_bounds
-                buffers::uniform_entry(3),       // camera
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: OUTPUT_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -162,6 +300,7 @@ impl GpuRenderer {
             node_buf,
             leaf_buf,
             bounds_buf,
+            mode,
             camera_buf,
             max_binding,
             timing,
@@ -180,7 +319,18 @@ impl GpuRenderer {
     /// [`flush_and_wait`](Self::flush_and_wait).
     ///
     /// [`Edit::Leaf`]: voxel_core::Edit::Leaf
-    pub fn update_leaf(&self, structure: &SchoolBBuffer, leaf_idx: u32) {
+    ///
+    /// # Errors
+    /// Returns [`GpuError::Unsupported`] on a truecolor renderer: per-voxel colour
+    /// is build-once (an occupancy edit would leave `leaf_color` stale), so the
+    /// scene must be re-baked via [`new`](Self::new).
+    pub fn update_leaf(&self, structure: &SchoolBBuffer, leaf_idx: u32) -> Result<(), GpuError> {
+        if !matches!(self.mode, RenderMode::Palette { .. }) {
+            return Err(GpuError::Unsupported {
+                n: structure.resolution().voxels_per_axis(),
+                reason: "truecolor renderer is build-once; re-bake via GpuRenderer::new after an edit",
+            });
+        }
         let words = structure.leaf_at(leaf_idx).words32();
         self.queue.write_buffer(
             &self.leaf_buf,
@@ -193,6 +343,39 @@ impl GpuRenderer {
             u64::from(leaf_idx) * 4,
             bytemuck::bytes_of(&bounds),
         );
+        Ok(())
+    }
+
+    /// Patches a single leaf's material slot onto the GPU after an in-place
+    /// material edit ([`Edit::Material { spilled: false, .. }`]). `structure` must
+    /// already have had [`SchoolBBuffer::patch_leaf_mat`] applied for `leaf_idx`;
+    /// this copies that leaf's `STRIDE_W` words (at `leaf_idx * STRIDE_W * 4`
+    /// bytes) via one `queue.write_buffer` — the same O(1) shape as
+    /// [`update_leaf`](Self::update_leaf). A *spilled* edit bumps the topology
+    /// generation and must go through [`reupload`](Self::reupload) instead.
+    ///
+    /// [`Edit::Material { spilled: false, .. }`]: voxel_core::Edit::Material
+    ///
+    /// # Errors
+    /// Returns [`GpuError::Unsupported`] on a truecolor renderer (no `leaf_mat`
+    /// buffer exists; colour is build-once — re-bake via [`new`](Self::new)).
+    pub fn update_leaf_mat(
+        &self,
+        structure: &SchoolBBuffer,
+        leaf_idx: u32,
+    ) -> Result<(), GpuError> {
+        let RenderMode::Palette { leaf_mat_buf, .. } = &self.mode else {
+            return Err(GpuError::Unsupported {
+                n: structure.resolution().voxels_per_axis(),
+                reason: "truecolor renderer is build-once; re-bake via GpuRenderer::new after an edit",
+            });
+        };
+        let stride_w = voxel_core::palette::STRIDE_W;
+        let base = leaf_idx as usize * stride_w;
+        let slot = &structure.leaf_mat_words()[base..base + stride_w];
+        self.queue
+            .write_buffer(leaf_mat_buf, (base * 4) as u64, bytemuck::cast_slice(slot));
+        Ok(())
     }
 
     /// Replaces the resident structure after a topology edit
@@ -203,12 +386,45 @@ impl GpuRenderer {
     /// render.
     ///
     /// [`Edit::Topology`]: voxel_core::Edit::Topology
+    ///
+    /// # Errors
+    /// Returns [`GpuError::BufferTooLarge`] if a structure buffer exceeds the
+    /// binding cap, or [`GpuError::Unsupported`] on a truecolor renderer (per-voxel
+    /// colour is build-once — a topology edit renumbers leaves and invalidates the
+    /// colour chunks; re-bake via [`new`](Self::new)).
     pub fn reupload(&mut self, structure: &SchoolBBuffer) -> Result<(), GpuError> {
+        if !matches!(self.mode, RenderMode::Palette { .. }) {
+            return Err(GpuError::Unsupported {
+                n: structure.resolution().voxels_per_axis(),
+                reason: "truecolor renderer is build-once; re-bake via GpuRenderer::new after an edit",
+            });
+        }
         let (node_buf, leaf_buf, bounds_buf) =
             buffers::upload_structure(&self.device, structure, self.max_binding)?;
         self.node_buf = node_buf;
         self.leaf_buf = leaf_buf;
         self.bounds_buf = bounds_buf;
+        // The material slots are index-parallel with the leaves, so a topology
+        // edit (renumbered leaves, possibly a spilled material change) invalidates
+        // them too — rebuild `leaf_mat`. The global colour `table` is unchanged by
+        // a topology/material edit, so its buffer stays.
+        let stride_w = voxel_core::palette::STRIDE_W;
+        let mut mat_words = structure.leaf_mat_words().to_vec();
+        if mat_words.is_empty() {
+            mat_words = vec![0u32; stride_w];
+        }
+        let new_mat = wgpu::util::DeviceExt::create_buffer_init(
+            &self.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("leaf_mat"),
+                contents: bytemuck::cast_slice(&mat_words),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+        // Guard above guarantees the Palette arm; assign the rebuilt buffer.
+        if let RenderMode::Palette { leaf_mat_buf, .. } = &mut self.mode {
+            *leaf_mat_buf = new_mat;
+        }
         Ok(())
     }
 
@@ -280,16 +496,40 @@ impl GpuRenderer {
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(camera));
 
+        let mut entries = vec![
+            buffers::bind(0, self.node_buf.as_entire_binding()),
+            buffers::bind(1, self.leaf_buf.as_entire_binding()),
+            buffers::bind(2, self.bounds_buf.as_entire_binding()),
+            buffers::bind(3, self.camera_buf.as_entire_binding()),
+            buffers::bind(4, wgpu::BindingResource::TextureView(output)),
+        ];
+        match &self.mode {
+            RenderMode::Palette {
+                leaf_mat_buf,
+                table_buf,
+            } => {
+                entries.push(buffers::bind(5, leaf_mat_buf.as_entire_binding()));
+                entries.push(buffers::bind(6, table_buf.as_entire_binding()));
+            }
+            RenderMode::Truecolor {
+                base_buf,
+                chunks,
+                dummy_buf,
+            } => {
+                entries.push(buffers::bind(5, base_buf.as_entire_binding()));
+                // Slots 6..8: real chunk `i` if present, else the shared dummy. The
+                // probe guaranteed `N <= N_MAX` and every valid hit `g < N*PER_CHUNK`,
+                // so a dummy slot is bound but never indexed by a real read.
+                for i in 0..buffers::N_MAX_CHUNKS {
+                    let buf = chunks.get(i as usize).unwrap_or(dummy_buf);
+                    entries.push(buffers::bind(6 + i, buf.as_entire_binding()));
+                }
+            }
+        }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("render bind group"),
             layout: &self.layout,
-            entries: &[
-                buffers::bind(0, self.node_buf.as_entire_binding()),
-                buffers::bind(1, self.leaf_buf.as_entire_binding()),
-                buffers::bind(2, self.bounds_buf.as_entire_binding()),
-                buffers::bind(3, self.camera_buf.as_entire_binding()),
-                buffers::bind(4, wgpu::BindingResource::TextureView(output)),
-            ],
+            entries: &entries,
         });
 
         let timing = if timed { self.timing.as_ref() } else { None };

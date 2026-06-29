@@ -539,6 +539,8 @@ mod tests {
         let mesh = MeshInput {
             triangles: Vec::new(),
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
 
         let gpu_out = pollster::block_on(gpu.voxelize_surface(&mesh, &grid, &tiles, &opts))
@@ -585,6 +587,8 @@ mod tests {
                 Vec3::new(2.0, 8.0, 4.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         match pollster::block_on(gpu.voxelize_surface(&mesh, &grid, &tiles, &opts)) {
             Ok(out) => {
@@ -662,6 +666,8 @@ mod tests {
                 Vec3::new(6.0, 60.0, 12.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         // (store_owner, store_color) — color requires owner, so skip (false,true).
         for (owner, color) in [(false, false), (true, false), (true, true)] {
@@ -701,6 +707,8 @@ mod tests {
                 Vec3::new(6.0, 60.0, 12.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let err = pollster::block_on(gpu.voxelize_surface(&mesh, &grid, &tiles, &opts))
             .expect_err("an over-large tile must be rejected");
@@ -748,6 +756,8 @@ mod tests {
                 Vec3::new(30.0, 500.0, 250.0),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
 
         let gpu_out = pollster::block_on(gpu.voxelize_surface(&mesh, &grid, &tiles, &opts))

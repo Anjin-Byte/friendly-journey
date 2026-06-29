@@ -336,6 +336,7 @@ fn time_class_costs(tree: &SparseTree, n: u32, edits: u32, state: &mut u64) -> C
                 topo.1 += 1;
             }
             Edit::Unchanged => {}
+            Edit::Material { .. } => unreachable!("set_voxel never returns Material"), // occupancy edits only — set_voxel never spills materials
         }
     }
     let (leaf_s, leaf_batch) = time_leaf_batch(tree.clone(), n, edits.max(50_000), state);
@@ -445,6 +446,7 @@ fn time_brush_stamps(
                     any_topo = true;
                 }
                 Edit::Unchanged => {}
+                Edit::Material { .. } => unreachable!("set_voxel never returns Material"), // occupancy edits only
             }
         }
         s.total += t.elapsed();
@@ -470,12 +472,14 @@ fn time_brush_stamps(
 /// Returns `(µs per leaf patch, ms per full re-upload)`.
 fn time_gpu_patch(ctx: &GpuContext, tree: &SparseTree) -> Result<(f64, f64)> {
     let structure = SchoolBBuffer::from_sparse(tree);
-    let mut renderer = GpuRenderer::new(ctx, &structure)?;
+    // Edit-timing bench: occupancy only, so the magenta-only table is fine.
+    let mut renderer =
+        GpuRenderer::new(ctx, &structure, &voxel_core::MaterialTable::missing_only())?;
 
     let patches = 10_000u32;
     let t = std::time::Instant::now();
     for _ in 0..patches {
-        renderer.update_leaf(&structure, 0); // re-stage leaf 0's words (O(1))
+        let _ = renderer.update_leaf(&structure, 0); // re-stage leaf 0's words (O(1)); palette → infallible
     }
     let leaf_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(patches);
 

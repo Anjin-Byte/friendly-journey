@@ -1,8 +1,10 @@
-//! CPU reference voxelizer used as a bit-exact oracle for the GPU path.
+//! CPU reference voxelizer — the conservative-superset oracle for the GPU path
+//! (bit-exact on tangent-free meshes; at f32 tangent voxels the GPU may over-mark
+//! by one, never under-mark).
 //!
 //! [`voxelize_surface_cpu`] rasterizes a triangle mesh into a dense occupancy
 //! grid using the Akenine-Möller triangle/box separating-axis-theorem (SAT)
-//! overlap test ([`triangle_box_overlap`]). The differential tests in
+//! overlap test (`triangle_box_overlap`). The differential tests in
 //! `tests/differential.rs` compare this output against [`crate::gpu`] to guard
 //! the WGSL implementation.
 
@@ -17,7 +19,18 @@ use crate::core::{
 /// Returns `true` if the triangle `(v0, v1, v2)` overlaps the box centered at
 /// `box_center` with half-extents `box_half`. Tests the 13 SAT axes: the 9
 /// edge-cross-axis products, the 3 box face normals, and the triangle normal.
-fn triangle_box_overlap(box_center: Vec3, box_half: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> bool {
+///
+/// Crate-internal: the SAT overlap test the reference voxelizer and its
+/// differential tests share. (Not part of the public API — the bake uses
+/// nearest-surface owners per design D2, not this overlap.)
+#[must_use]
+pub(crate) fn triangle_box_overlap(
+    box_center: Vec3,
+    box_half: Vec3,
+    v0: Vec3,
+    v1: Vec3,
+    v2: Vec3,
+) -> bool {
     let v0 = v0 - box_center;
     let v1 = v1 - box_center;
     let v2 = v2 - box_center;
@@ -89,7 +102,7 @@ fn hash_color(id: u32) -> u32 {
 ///
 /// This is the reference oracle: for each triangle it scans the voxels in its
 /// (epsilon-padded) grid-space AABB and marks every voxel whose unit cube
-/// overlaps the triangle per [`triangle_box_overlap`]. When `opts.store_owner`
+/// overlaps the triangle per `triangle_box_overlap`. When `opts.store_owner`
 /// is set, each voxel records the lowest triangle index that covered it; when
 /// `opts.store_color` is set, those owners are hashed into colors. `tiles` is
 /// accepted for signature parity with the GPU path and only feeds the reported
@@ -203,6 +216,8 @@ mod tests {
                 Vec3::new(0.1, 1.2, 0.1),
             ]],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let output = voxelize_surface_cpu(&mesh, &grid, &tiles, &VoxelizeOpts::default());
         let occupied = output.occupancy.count_occupied() > 0;
@@ -314,6 +329,8 @@ mod tests {
                 ],
             ],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let mut reference: Option<Vec<u32>> = None;
         for epsilon in [0.0_f32, 1e-4, 0.5, 2.0] {
@@ -350,6 +367,8 @@ mod tests {
                     Vec3::new(1.0, 7.0, 5.0),
                 ]],
                 material_ids: None,
+                uvs: None,
+                appearance: None,
             },
             MeshInput {
                 triangles: vec![
@@ -365,6 +384,8 @@ mod tests {
                     ],
                 ],
                 material_ids: None,
+                uvs: None,
+                appearance: None,
             },
         ];
         for mesh in &meshes {
@@ -403,6 +424,8 @@ mod tests {
         let mesh = MeshInput {
             triangles: vec![tri, tri, tri],
             material_ids: None,
+            uvs: None,
+            appearance: None,
         };
         let opts = VoxelizeOpts {
             epsilon: 1e-4,
@@ -454,6 +477,8 @@ mod tests {
             let mesh = MeshInput {
                 triangles: vec![tri],
                 material_ids: None,
+                uvs: None,
+                appearance: None,
             };
             let out = voxelize_surface_cpu(&mesh, &grid, &tiles, &VoxelizeOpts::default());
             assert_eq!(
@@ -480,7 +505,12 @@ mod tests {
             let v0 = Vec3::new(ax, ay, az);
             let v1 = Vec3::new(bx, by, bz);
             let v2 = Vec3::new(cx, cy, cz);
-            let mesh = MeshInput { triangles: vec![[v0, v1, v2]], material_ids: None };
+            let mesh = MeshInput {
+                triangles: vec![[v0, v1, v2]],
+                material_ids: None,
+                uvs: None,
+                appearance: None,
+            };
             let out = voxelize_surface_cpu(&mesh, &grid, &tiles, &VoxelizeOpts::default());
             for z in 0..8u32 {
                 for y in 0..8u32 {

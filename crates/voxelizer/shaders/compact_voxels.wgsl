@@ -48,17 +48,20 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         let vy = (linear / brick_dim) % brick_dim;
         let vz = (linear / (brick_dim * brick_dim));
 
-        // Resolve material from owner triangle → material table
+        // Resolve material from owner triangle → material table. The table maps
+        // triangle → renderer GLOBAL id (u16, two per word); an unowned voxel or
+        // an unresolved triangle stays material 0 = global-0 = magenta MISSING
+        // (docs/materials/05 hole 1). No 0→1 clamp: a real 0 must survive so the
+        // sentinel renders loud magenta instead of aliasing a real material.
         let attr_index = brick_index * brick_voxels + linear;
         let tri = owner_id[attr_index];
-        var mat: u32 = 1u; // MATERIAL_DEFAULT
+        var mat: u32 = 0u; // global-0 (MISSING) default
         if (tri != 0xFFFFFFFFu && params.material_table_len > 0u) {
           let word_idx = tri >> 1u;
           let shift = (tri & 1u) << 4u;
           if (word_idx < params.material_table_len) {
             let packed = material_table[word_idx];
             mat = (packed >> shift) & 0xFFFFu;
-            if (mat == 0u) { mat = 1u; }
           }
         }
 

@@ -37,6 +37,8 @@ fn test_mesh() -> MeshInput {
             ],
         ],
         material_ids: None,
+        uvs: None,
+        appearance: None,
     }
 }
 
@@ -103,6 +105,8 @@ fn gpu_occupancy_is_conservative_superset_at_tangents() {
             Vec3::new(2.6, 6.3, 4.1),
         ]],
         material_ids: None,
+        uvs: None,
+        appearance: None,
     };
     let grid = VoxelGrid::new(Resolution::new(8).unwrap(), Vec3::ZERO, 1.0);
     let tiles = TileSpec::new([4, 4, 4], grid.dims()).unwrap();
@@ -182,6 +186,8 @@ fn cpu_oracle_marks_expected_voxels() {
             Vec3::new(1.5, 5.5, 1.5),
         ]],
         material_ids: None,
+        uvs: None,
+        appearance: None,
     };
     let out = voxelize_surface_cpu(&mesh, &grid, &tiles, &VoxelizeOpts::default());
 
@@ -207,6 +213,8 @@ fn empty_mesh_is_empty() {
     let mesh = MeshInput {
         triangles: Vec::new(),
         material_ids: None,
+        uvs: None,
+        appearance: None,
     };
     let out = voxelize_surface_cpu(&mesh, &grid, &tiles, &VoxelizeOpts::default());
     assert_eq!(out.occupancy.count_occupied(), 0);
