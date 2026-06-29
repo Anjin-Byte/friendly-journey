@@ -25,98 +25,8 @@
 // `d1..d6` / `va,vb,vc` names — clearer left as-is than renamed.
 #![allow(clippy::many_single_char_names)]
 
-use crate::error::VoxelizerError;
+use crate::appearance::{Texture, WrapMode};
 use glam::{Vec2, Vec3};
-
-/// glTF sampler wrap mode for one axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WrapMode {
-    /// `fract(u)` — tile the texture.
-    Repeat,
-    /// `clamp(u, 0, 1)` — extend the edge texel.
-    ClampToEdge,
-}
-
-/// glTF `alphaMode` — how a material's base-colour alpha is interpreted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AlphaMode {
-    /// Alpha is ignored; the surface is fully opaque. The default.
-    #[default]
-    Opaque,
-    /// Alpha-test: a texel is opaque iff its alpha `>= alpha_cutoff`, else absent.
-    Mask,
-    /// Alpha compositing (semi-transparent). Rendered, not cut.
-    Blend,
-}
-
-/// A decoded, **sRGB-encoded** RGBA8 base-colour texture (alpha is linear).
-///
-/// The fields are private and a `Texture` is only constructible through the
-/// checked [`Texture::new`], so the invariant `rgba.len() == width * height`
-/// with `width >= 1 && height >= 1` holds for *every* value that exists (Codex:
-/// *Make Invalid States Unrepresentable*, *Checked Constructors*). That is what
-/// lets the sampling primitives index `rgba` without a bounds check and never
-/// panic — a malformed texture cannot be represented, so it cannot reach them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Texture {
-    width: u32,
-    height: u32,
-    rgba: Vec<[u8; 4]>,
-}
-
-impl Texture {
-    /// Construct a texture, enforcing `width >= 1`, `height >= 1`, and
-    /// `rgba.len() == width * height` (computed in `usize`, so huge dims cannot
-    /// overflow the check).
-    ///
-    /// # Errors
-    /// Returns [`VoxelizerError::MalformedTexture`] if any invariant is
-    /// violated — the boundary at which a corrupt or hand-built texture is
-    /// rejected gracefully instead of panicking mid-bake.
-    pub fn new(width: u32, height: u32, rgba: Vec<[u8; 4]>) -> Result<Self, VoxelizerError> {
-        let expected = (width as usize).checked_mul(height as usize);
-        if width == 0 || height == 0 || expected != Some(rgba.len()) {
-            return Err(VoxelizerError::MalformedTexture {
-                width,
-                height,
-                len: rgba.len(),
-            });
-        }
-        Ok(Self {
-            width,
-            height,
-            rgba,
-        })
-    }
-
-    /// Width in texels (always `>= 1`).
-    #[must_use]
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    /// Height in texels (always `>= 1`).
-    #[must_use]
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// Row-major `width * height` RGBA8 texels (R in `[0]`).
-    #[must_use]
-    pub fn rgba(&self) -> &[[u8; 4]] {
-        &self.rgba
-    }
-
-    /// The texel at `(x, y)` (caller clamps/wraps to valid coords).
-    ///
-    /// Indexes in `usize`; the [`Texture::new`] invariant guarantees the index
-    /// is in range for any in-bounds `(x, y)`, so this cannot panic in practice.
-    #[must_use]
-    fn texel(&self, x: u32, y: u32) -> [u8; 4] {
-        let i = (y as usize) * (self.width as usize) + (x as usize);
-        self.rgba[i]
-    }
-}
 
 /// sRGB → linear for one 0..=255 channel byte.
 #[must_use]
@@ -174,8 +84,8 @@ fn sample_bilinear_linear(tex: &Texture, uv: Vec2, wrap_s: WrapMode, wrap_t: Wra
     let u = wrap(uv.x, wrap_s);
     let v = wrap(uv.y, wrap_t);
     // Texel-centre convention: texel centre i maps to (i+0.5)/dim.
-    let fx = u * tex.width as f32 - 0.5;
-    let fy = v * tex.height as f32 - 0.5;
+    let fx = u * tex.width() as f32 - 0.5;
+    let fy = v * tex.height() as f32 - 0.5;
     let x0 = fx.floor();
     let y0 = fy.floor();
     let tx = fx - x0;
@@ -184,9 +94,9 @@ fn sample_bilinear_linear(tex: &Texture, uv: Vec2, wrap_s: WrapMode, wrap_t: Wra
 
     // Four taps, each wrapped to a valid texel, decoded sRGB→linear (alpha linear).
     let tap = |xi: i64, yi: i64| -> [f32; 4] {
-        let x = wrap_texel(xi, tex.width, wrap_s);
-        let y = wrap_texel(yi, tex.height, wrap_t);
-        let t = tex.texel(x, y);
+        let x = wrap_texel(xi, tex.width(), wrap_s);
+        let y = wrap_texel(yi, tex.height(), wrap_t);
+        let t = tex.rgba()[(y as usize) * (tex.width() as usize) + (x as usize)];
         [
             srgb_to_linear(t[0]),
             srgb_to_linear(t[1]),
@@ -379,7 +289,7 @@ pub fn expected_color_filtered(
     } else {
         0.0
     };
-    let footprint = d1.max(d2) * tex.width.max(tex.height) as f32;
+    let footprint = d1.max(d2) * tex.width().max(tex.height()) as f32;
     // `+ 0.5` is a half-texel guard band: it pushes the texel≈voxel Nyquist zone
     // (footprint ≈ 1, where the worst moiré lives) up to s=2 rather than leaving it
     // at a single tap, while a clearly magnified footprint (≲ 0.5) still resolves to
@@ -507,50 +417,6 @@ mod tests {
             ],
         )
         .expect("2x2 checker is a valid texture")
-    }
-
-    /// `Texture::new` accepts a texture whose `rgba` exactly fills `width*height`
-    /// and exposes the dimensions back through the accessors.
-    #[test]
-    fn texture_new_accepts_exact_grid() {
-        let t = Texture::new(2, 3, vec![[0, 0, 0, 255]; 6]).expect("2x3 of 6 texels is valid");
-        assert_eq!((t.width(), t.height(), t.rgba().len()), (2, 3, 6));
-    }
-
-    /// `Texture::new` rejects an `rgba` shorter (or longer) than `width*height` —
-    /// the exact pre-fix panic class (`Texture::texel` indexed past `rgba`).
-    #[test]
-    fn texture_new_rejects_length_mismatch() {
-        let short = Texture::new(8, 8, vec![[1, 2, 3, 4]]); // 1 texel, needs 64
-        assert!(
-            matches!(short, Err(VoxelizerError::MalformedTexture { .. })),
-            "short rgba must be rejected, got {short:?}"
-        );
-        let long = Texture::new(1, 1, vec![[0; 4]; 2]); // 2 texels, needs 1
-        assert!(matches!(long, Err(VoxelizerError::MalformedTexture { .. })));
-    }
-
-    /// `Texture::new` rejects a zero dimension (the pre-fix `wrap_texel`
-    /// `clamp(0,-1)` / `rem_euclid(0)` panic at `dim == 0`).
-    #[test]
-    fn texture_new_rejects_zero_dimension() {
-        assert!(matches!(
-            Texture::new(0, 4, vec![]),
-            Err(VoxelizerError::MalformedTexture { .. })
-        ));
-        assert!(matches!(
-            Texture::new(4, 0, vec![]),
-            Err(VoxelizerError::MalformedTexture { .. })
-        ));
-    }
-
-    /// Huge dimensions are rejected at construction (the `width*height` product is
-    /// computed in `usize`, so the check itself cannot overflow) — closing the
-    /// pre-fix `u32` index-overflow path before any indexing happens.
-    #[test]
-    fn texture_new_rejects_huge_dimensions() {
-        let huge = Texture::new(70_000, 70_000, vec![[0; 4]]); // 4.9e9 texels declared
-        assert!(matches!(huge, Err(VoxelizerError::MalformedTexture { .. })));
     }
 
     /// A unit triangle in the z=0 plane whose UVs map directly to the unit square,

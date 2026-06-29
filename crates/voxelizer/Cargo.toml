@@ -6,6 +6,9 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+# Application workspace, not a published library — never goes to crates.io. Also
+# lets the supply-chain gate (`cargo xtask ci-deps`) accept the internal path deps.
+publish = false
 
 [features]
 # Default-on so plain `cargo test`/`clippy` exercise both input adapters, but
@@ -16,6 +19,14 @@ default = ["gltf", "obj", "stl"]
 gltf = ["dep:gltf"]
 obj = ["dep:tobj", "dep:image"]
 stl = ["dep:stl_io"]
+
+# The example loads a textured mesh via `load_mesh`/`rotation_degrees`, which are
+# gated behind the loader features. Without this, `--no-default-features
+# --all-targets` fails to compile the example (the symbols are cfg'd out); the
+# `required-features` makes Cargo skip it when no glTF loader is present.
+[[example]]
+name = "material_leaf_histogram"
+required-features = ["gltf"]
 
 [dependencies]
 voxel-core = { workspace = true }

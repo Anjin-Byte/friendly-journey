@@ -3,10 +3,6 @@
 //! texture — no readback, no CPU ray-gen, no CPU shading. The viewer blits the
 //! resulting texture to its surface.
 
-// Unsafe Quarantine: the only `unsafe` is the `bytemuck` derive on the
-// `#[repr(C)]` all-scalar camera uniform.
-#![allow(unsafe_code)]
-
 use bytemuck::{Pod, Zeroable};
 
 use voxel_core::{MaterialTable, NodeLayout, SchoolBBuffer};
@@ -18,30 +14,39 @@ use crate::error::GpuError;
 /// The output storage-texture format the render kernel writes.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Camera uniform, matching `render.wgsl`'s `Camera` (std140-friendly: every
-/// `vec3` is followed by a scalar to fill its 16-byte slot).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct GpuCamera {
-    /// Camera world position.
-    pub eye: [f32; 3],
-    /// `tan(fov/2)`.
-    pub tan: f32,
-    /// Forward (unit) direction.
-    pub forward: [f32; 3],
-    /// Width / height.
-    pub aspect: f32,
-    /// Right (unit) direction.
-    pub right: [f32; 3],
-    /// Grid resolution `n` as `f32`.
-    pub n: f32,
-    /// Up (unit) direction.
-    pub up: [f32; 3],
-    /// Padding to keep the following `dims` 16-byte aligned.
-    pub pad: f32,
-    /// `[width, height, internal_levels(k), 0]`.
-    pub dims: [u32; 4],
+// Pod upload struct. The `unsafe` here is only the `bytemuck` derive on
+// `#[repr(C)]` all-scalar data (Unsafe Quarantine); none is hand-written. Scoped
+// to this module so the rest of the file stays under `unsafe_code = deny`.
+#[allow(unsafe_code)]
+mod pod {
+    use super::{Pod, Zeroable};
+
+    /// Camera uniform, matching `render.wgsl`'s `Camera` (std140-friendly: every
+    /// `vec3` is followed by a scalar to fill its 16-byte slot).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Pod, Zeroable)]
+    pub struct GpuCamera {
+        /// Camera world position.
+        pub eye: [f32; 3],
+        /// `tan(fov/2)`.
+        pub tan: f32,
+        /// Forward (unit) direction.
+        pub forward: [f32; 3],
+        /// Width / height.
+        pub aspect: f32,
+        /// Right (unit) direction.
+        pub right: [f32; 3],
+        /// Grid resolution `n` as `f32`.
+        pub n: f32,
+        /// Up (unit) direction.
+        pub up: [f32; 3],
+        /// Padding to keep the following `dims` 16-byte aligned.
+        pub pad: f32,
+        /// `[width, height, internal_levels(k), 0]`.
+        pub dims: [u32; 4],
+    }
 }
+pub use pod::GpuCamera;
 
 /// Reusable compute-pass timestamp resources (present iff the device supports
 /// `TIMESTAMP_QUERY`): a 2-slot query set and the resolve/readback buffers.

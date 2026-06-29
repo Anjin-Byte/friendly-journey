@@ -16,11 +16,11 @@ use voxel_core::{
     mirror_traverse,
 };
 use voxel_gpu::{GpuContext, GpuError, GpuRenderer, GpuTraverser};
-use voxelizer::loader::{load_mesh, rotation_degrees};
 use voxelizer::reference_cpu::voxelize_surface_cpu;
 use voxelizer::{
     GpuVoxelizer, GpuVoxelizerConfig, MeshInput, TileSpec, VoxelGrid, VoxelOccupancy, VoxelizeOpts,
 };
+use voxelizer::{load_mesh, rotation_degrees};
 
 #[derive(Parser)]
 #[command(name = "voxel", about = "Sparse MIP voxel structure — headless tools")]
@@ -1333,5 +1333,65 @@ fn voxelize_diff(
         Ok(())
     } else {
         anyhow::bail!("GPU under-marked {under} voxels — a real divergence, not a tangent effect")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn res8() -> Resolution {
+        Resolution::new(8).unwrap()
+    }
+
+    /// `build_tree` produces a non-empty structure whose occupancy matches the
+    /// fixture: a `Solid` 8³ grid is one fully-occupied leaf.
+    #[test]
+    fn build_tree_solid_is_one_full_leaf() {
+        let tree = build_tree(Fixture::Solid, res8());
+        assert_eq!(tree.leaf_count(), 1, "an 8³ Solid is a single brick");
+        assert!(tree.is_occupied(VoxelCoord::new(0, 0, 0)));
+        assert!(tree.is_occupied(VoxelCoord::new(7, 7, 7)));
+    }
+
+    /// A sparse fixture builds a non-empty tree that is not fully solid (proving
+    /// `build_tree` dispatches to the real fixture, not a constant).
+    #[test]
+    fn build_tree_sierpinski_is_sparse_nonempty() {
+        let tree = build_tree(Fixture::Sierpinski, Resolution::new(32).unwrap());
+        assert!(tree.leaf_count() > 0, "sierpinski occupies some voxels");
+        let n = tree.resolution().voxels_per_axis();
+        let occupied = (0..n)
+            .flat_map(|z| (0..n).flat_map(move |y| (0..n).map(move |x| (x, y, z))))
+            .filter(|&(x, y, z)| tree.is_occupied(VoxelCoord::new(x, y, z)))
+            .count();
+        assert!(occupied > 0, "some voxels occupied");
+        assert!(
+            occupied < (n * n * n) as usize,
+            "sierpinski is sparse, not solid"
+        );
+    }
+
+    /// `camera_rays` returns exactly `count` rays with finite, non-degenerate
+    /// directions, and is deterministic (the splitmix64 stream is seeded).
+    #[test]
+    fn camera_rays_count_finite_and_deterministic() {
+        let rays = camera_rays(res8(), 256);
+        assert_eq!(rays.len(), 256);
+        for r in &rays {
+            assert!(r.origin.is_finite(), "ray origin must be finite");
+            assert!(
+                r.dir.length() > 1e-6 && r.dir.is_finite(),
+                "ray direction must be finite and non-degenerate"
+            );
+        }
+        // Deterministic: same seed → identical rays.
+        let again = camera_rays(res8(), 256);
+        assert!(
+            rays.iter()
+                .zip(&again)
+                .all(|(a, b)| a.origin == b.origin && a.dir == b.dir),
+            "camera_rays must be deterministic"
+        );
     }
 }

@@ -227,6 +227,16 @@ fn enumerate_slab<F: OccupancyField>(
 impl SparseTree {
     /// Builds the sparse hierarchy from an occupancy field (`idea.md` §6.4
     /// steps 1–4).
+    ///
+    /// # Examples
+    /// ```
+    /// use voxel_core::{Resolution, SparseTree, VoxelCoord};
+    /// use voxel_core::fixtures::Solid;
+    ///
+    /// let tree = SparseTree::build(&Solid { resolution: Resolution::new(8).unwrap() });
+    /// assert_eq!(tree.leaf_count(), 1); // an 8³ solid is a single full brick
+    /// assert!(tree.is_occupied(VoxelCoord::new(0, 0, 0)));
+    /// ```
     #[must_use]
     pub fn build<F: OccupancyField + Sync>(field: &F) -> Self {
         let resolution = field.resolution();

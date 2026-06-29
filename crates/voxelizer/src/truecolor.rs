@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use glam::{Mat4, Vec2, Vec3};
 use voxel_core::{MISSING_MAGENTA, SchoolBBuffer, SparseTree};
 
-use crate::bake::{AlphaMode, ColorCandidate, Texture, WrapMode, bake_nearest_owner};
+use crate::appearance::{AlphaMode, Texture, WrapMode};
+use crate::bake::{ColorCandidate, bake_nearest_owner};
 use crate::core::{CompactVoxel, MeshAppearance, MeshInput, VoxelGrid};
 use crate::csr::{BrickTriangleCsr, build_brick_csr};
 
@@ -347,7 +348,7 @@ pub fn cull_mask_cutout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bake::{WrapMode, expected_color};
+    use crate::bake::expected_color;
     use crate::core::{MaterialDef, MeshAppearance};
     use voxel_core::{Resolution, VoxelCoord};
 

@@ -54,6 +54,12 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"   # error contracts are expressed by the thiserror enums themselves.
 missing_panics_doc = "allow"
+# The footgun lints `unwrap_used` / `expect_used` are intentionally NOT enabled.
+# This codebase uses deliberate, proof-carrying `expect("…")` messages as inline
+# correctness arguments (e.g. `expect("masked to 16 bits")` next to the mask that
+# guarantees it) — ~150+ such sites across the core crates. A blanket lint would
+# force an `#[allow]` at each for no real safety gain, so the discipline here is
+# "every panic-site carries a written justification", enforced by review, not a lint.
 
 # Profiles are only recognized in the root manifest.
 [profile.dev]

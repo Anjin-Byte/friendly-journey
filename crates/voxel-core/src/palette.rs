@@ -99,6 +99,17 @@ pub struct MaterialTable {
 impl MaterialTable {
     /// A table holding only the reserved magenta MISSING slot — every voxel
     /// renders magenta until [`push`](Self::push) adds real materials.
+    ///
+    /// # Examples
+    /// ```
+    /// use voxel_core::MaterialTable;
+    ///
+    /// let mut table = MaterialTable::missing_only();
+    /// // Real materials get dense ids from 1 (id 0 stays the magenta sentinel).
+    /// let green = table.push(0xFF00_FF00).unwrap();
+    /// assert_eq!(green, 1);
+    /// assert_eq!(table.color(green), 0xFF00_FF00);
+    /// ```
     #[must_use]
     pub fn missing_only() -> Self {
         Self {
@@ -366,10 +377,32 @@ mod tests {
     use super::*;
     use crate::morton::encode_brick;
 
-    /// Alias for the canonical [`read_slot`] CPU mirror — the parity test pins
-    /// `pack` against this literal WGSL transcription.
+    /// A standalone, literal transcription of the GPU material reader
+    /// (`render.wgsl` `read_material`) for a single leaf slot (`base = 0`), using
+    /// the WGSL's own offsets (`MAT_IDX_OFF = 9`, `MAT_PAL_OFF = 1`). It shares
+    /// **no code** with [`read_slot`], so the round-trip test below is a genuine
+    /// independent witness of the GPU decode — not a self-alias. Mirrors the
+    /// `wgsl_rank` / `brute_force_rank` / `occupied_rank` triple-oracle in
+    /// `leaf.rs`. Keep this in lockstep with `render.wgsl` if that layout changes.
     fn wgsl_unpack(words: &[u32; STRIDE_W], morton: u32) -> u16 {
-        read_slot(words, morton)
+        const WGSL_IDX_OFF: usize = 9;
+        const WGSL_PAL_OFF: usize = 1;
+        let bits = words[0] & 0xF; // header word: bits_per_voxel
+        let mut pi: u32 = 0;
+        if bits != 0 {
+            // MANDATORY: bits==0 would make the mask `(1<<0)-1 == 0` degenerate.
+            let off = morton * bits;
+            let pos = off & 31;
+            let iw = WGSL_IDX_OFF + (off >> 5) as usize;
+            pi = words[iw] >> pos;
+            if pos + bits > 32 {
+                // Index straddles two 32-bit words; stitch in the high part.
+                pi |= words[iw + 1] << (32 - pos);
+            }
+            pi &= (1u32 << bits) - 1;
+        }
+        let pal_word = words[WGSL_PAL_OFF + (pi >> 1) as usize];
+        u16::try_from((pal_word >> (16 * (pi & 1))) & 0xFFFF).expect("masked to 16 bits")
     }
 
     #[test]
@@ -446,6 +479,15 @@ mod tests {
                     let pi = assign(x, y, z);
                     assert!(usize::from(pi) < plen);
                     let got = wgsl_unpack(&packed, m);
+                    // Triple-witness: the independent WGSL transcription, the
+                    // production CPU mirror (`read_slot`), and the brute-force
+                    // expected palette entry must all agree. A WGSL↔CPU drift
+                    // fails the first assert; a packer bug fails the second.
+                    assert_eq!(
+                        read_slot(&packed, m),
+                        got,
+                        "read_slot disagrees with the WGSL transcription at ({x},{y},{z}) morton {m}"
+                    );
                     assert_eq!(
                         got,
                         expected[usize::from(pi)],
@@ -505,6 +547,40 @@ mod tests {
         assert_eq!(packed[PAL_OFF + 1], 0x3333_2222);
         assert_eq!(wgsl_unpack(&packed, encode_brick(0, 0, 0)), 0x2222);
         assert_eq!(wgsl_unpack(&packed, encode_brick(1, 0, 0)), 0x3333);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Random palettes (1..=16 entries) with random per-voxel index patterns
+        /// round-trip through `pack` → `read_slot` for every voxel — the property
+        /// generalization of `wgsl_bit_layout_matches_pack`, covering arbitrary
+        /// index distributions across every bit-width 0..=4 (not just the fixed
+        /// `x>=4` / `(x+y)%4` patterns).
+        #[test]
+        fn pack_read_slot_roundtrips_random_palettes(plen in 1usize..=16, seed in any::<u64>()) {
+            let palette: Vec<u16> = (0..plen).map(|i| 1000u16 + u16::try_from(i).unwrap()).collect();
+            // Pure per-voxel assignment: a hash of (morton, seed) into 0..plen.
+            let assign = |x: u32, y: u32, z: u32| -> u8 {
+                let m = u64::from(encode_brick(x, y, z));
+                let h = (m.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed)
+                    .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                u8::try_from((h >> 33) % plen as u64).expect("index < plen <= 16")
+            };
+            let leaf = LeafMaterials::from_local(palette.clone(), assign).unwrap();
+            let packed = leaf.pack();
+            for z in 0..8u32 {
+                for y in 0..8u32 {
+                    for x in 0..8u32 {
+                        let pi = assign(x, y, z);
+                        prop_assert_eq!(
+                            read_slot(&packed, encode_brick(x, y, z)),
+                            palette[usize::from(pi)]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

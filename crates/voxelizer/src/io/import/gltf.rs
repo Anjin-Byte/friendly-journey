@@ -53,7 +53,7 @@
 
 use glam::{Mat4, Vec2, Vec3};
 
-use crate::bake::{AlphaMode, Texture, WrapMode};
+use crate::appearance::{AlphaMode, Texture, WrapMode};
 use crate::core::{MaterialDef, MeshAppearance, MeshInput};
 use crate::error::VoxelizerError;
 
@@ -258,6 +258,15 @@ pub fn load_gltf_slice(bytes: &[u8]) -> Result<MeshInput, VoxelizerError> {
 /// Reads the file then delegates to [`load_gltf_slice`]. Unlike a bare slice,
 /// this still cannot follow external buffer URIs (it does not resolve relative
 /// `.bin` paths); for multi-file glTF, prefer a GLB or a buffer-embedded glTF.
+///
+/// # Examples
+/// ```no_run
+/// use voxelizer::load_gltf_path;
+///
+/// let mesh = load_gltf_path("model.glb")?;
+/// println!("{} world-space triangles", mesh.triangles.len());
+/// # Ok::<(), voxelizer::VoxelizerError>(())
+/// ```
 ///
 /// # Errors
 /// Returns [`VoxelizerError::MeshLoad`] if the file cannot be read, fails to

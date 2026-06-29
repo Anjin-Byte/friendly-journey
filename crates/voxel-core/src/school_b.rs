@@ -99,6 +99,16 @@ fn emit_subtree(
 
 impl SchoolBBuffer {
     /// Re-serializes a [`SparseTree`] into the School-B single-buffer layout.
+    ///
+    /// # Examples
+    /// ```
+    /// use voxel_core::{Resolution, SchoolBBuffer, SparseTree};
+    /// use voxel_core::fixtures::Solid;
+    ///
+    /// let tree = SparseTree::build(&Solid { resolution: Resolution::new(8).unwrap() });
+    /// let buf = SchoolBBuffer::from_sparse(&tree);
+    /// assert_eq!(buf.leaves().len(), tree.leaf_count());
+    /// ```
     #[must_use]
     pub fn from_sparse(tree: &SparseTree) -> Self {
         let resolution = tree.resolution();

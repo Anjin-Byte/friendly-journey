@@ -51,7 +51,7 @@ use std::path::Path;
 
 use glam::{Vec2, Vec3};
 
-use crate::bake::{AlphaMode, Texture, WrapMode};
+use crate::appearance::{AlphaMode, Texture, WrapMode};
 use crate::core::{MaterialDef, MeshAppearance, MeshInput};
 use crate::error::VoxelizerError;
 

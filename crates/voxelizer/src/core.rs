@@ -12,7 +12,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use voxel_core::{OccupancyField, Resolution, SchoolBBuffer, SparseTree, VoxelCoord};
 
-use crate::bake::{AlphaMode, Texture, WrapMode};
+pub use crate::appearance::{AlphaMode, MaterialDef, MeshAppearance, Texture, WrapMode};
 use crate::error::VoxelizerError;
 
 /// A cubic voxel grid: a [`Resolution`]-sized lattice (`n³`, `n = 8·4^k`) placed
@@ -310,42 +310,6 @@ impl TileSpec {
         }
         Ok(())
     }
-}
-
-/// One material's base-colour appearance: an optional sRGB texture (an index into
-/// [`MeshAppearance::textures`]), the **linear** base-colour tint, and the
-/// sampler's wrap modes. Indexed by `material_id`.
-#[derive(Debug, Clone)]
-pub struct MaterialDef {
-    /// The source material name (glTF `material.name`, MTL `newmtl`), lower-cased
-    /// matching is used to spot toon **outline** hulls in [`MeshInput::drop_outline_triangles`].
-    /// `None` for unnamed materials.
-    pub name: Option<String>,
-    /// Index into [`MeshAppearance::textures`], or `None` for an untextured
-    /// (flat `base_color_factor`) material.
-    pub base_color_texture: Option<usize>,
-    /// Linear `base_color_factor` tint (multiplies the sampled texel).
-    pub base_color_factor: [f32; 4],
-    /// Wrap mode for the U axis.
-    pub wrap_s: WrapMode,
-    /// Wrap mode for the V axis.
-    pub wrap_t: WrapMode,
-    /// glTF `alphaMode` (OBJ/STL default `Opaque`). MASK voxels below
-    /// [`alpha_cutoff`](Self::alpha_cutoff) are cut at bake time.
-    pub alpha_mode: AlphaMode,
-    /// glTF `alphaCutoff` (default `0.5`); only meaningful for `alpha_mode == Mask`.
-    pub alpha_cutoff: f32,
-}
-
-/// A mesh's base-colour appearance: the decoded textures plus one [`MaterialDef`]
-/// per `material_id`. Carried alongside the geometry so the per-voxel texture bake
-/// (`docs/materials/11`) can resolve `triangle → material → texture + UV → texel`.
-#[derive(Debug, Clone)]
-pub struct MeshAppearance {
-    /// Decoded sRGB base-colour textures, indexed by [`MaterialDef::base_color_texture`].
-    pub textures: Vec<Texture>,
-    /// Per-`material_id` appearance.
-    pub materials: Vec<MaterialDef>,
 }
 
 /// A triangle-soup mesh in world space, with optional per-triangle material ids,

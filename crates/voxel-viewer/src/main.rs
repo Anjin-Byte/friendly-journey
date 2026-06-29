@@ -43,8 +43,10 @@ use voxel_core::{
     traverse,
 };
 use voxel_gpu::{GpuCamera, GpuContext, GpuRenderer};
-use voxelizer::loader::{load_mesh, rotation_degrees};
-use voxelizer::{GpuVoxelizer, GpuVoxelizerConfig, VoxelGrid, VoxelizeOpts};
+use voxelizer::{
+    CompactVoxel, GpuVoxelizer, GpuVoxelizerConfig, MeshInput, VoxelGrid, VoxelizeOpts,
+};
+use voxelizer::{load_mesh, rotation_degrees};
 use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -982,16 +984,10 @@ fn build_from_mesh(
     let (table, packed) = voxelizer::material_table_for_sparse(&mesh)?;
     let voxels =
         pollster::block_on(vox.compact_surface_sparse(&mesh, &grid, &opts, &packed, [0, 0, 0]))?;
-    // Truecolor MASK alpha-cutout: drop voxels on a glTF MASK material's transparent
-    // texels BEFORE the tree is built (clearing occupancy after would corrupt
-    // occupied_rank). Truecolor only; BLEND glass is kept for Phase 2 compositing.
+
+    // MASK alpha-cutout (truecolor only), then build the renderer tree + buffer.
     let voxels = if truecolor {
-        let kept = voxelizer::cull_mask_cutout(&voxels, &mesh, &grid, opts.epsilon, Some(&packed));
-        let dropped = voxels.len() - kept.len();
-        if dropped > 0 {
-            eprintln!("  alpha-cutout dropped {dropped} MASK voxels");
-        }
-        kept
+        apply_mask_cutout(&voxels, &mesh, &grid, opts.epsilon, &packed)
     } else {
         voxels
     };
@@ -1006,46 +1002,79 @@ fn build_from_mesh(
     );
     let mut structure = SchoolBBuffer::from_sparse(&tree);
 
-    // Optional per-voxel truecolor bake (docs/materials/11). Needs the mesh +
-    // grid, both in scope here; baking sets `has_leaf_color()`, which routes the
-    // renderer through the truecolor pipeline. A textured glTF is required — an
-    // untextured mesh would bake flat white, so skip it and keep the palette path.
+    // Optional per-voxel truecolor bake.
     if truecolor {
-        if mesh.appearance.is_some() {
-            // Reject an over-ceiling truecolor scene BEFORE the multi-hundred-MB
-            // CPU colour bake. The GPU probe would reject it at renderer
-            // construction anyway — but only after the bake's wasted work. (C1)
-            if voxels.len() > voxel_gpu::MAX_TRUECOLOR_VOXELS {
-                anyhow::bail!(
-                    "truecolor scene has {} occupied voxels, over the {}-voxel colour \
-                     ceiling; lower --res or split the mesh",
-                    voxels.len(),
-                    voxel_gpu::MAX_TRUECOLOR_VOXELS,
-                );
-            }
-            eprintln!("  baking per-voxel truecolor…");
-            let t = Instant::now();
-            // `packed` constrains the colour owner to each voxel's own material so
-            // the bake can't sample a neighbouring surface's texture (the wrong-side
-            // bleed). It's the same per-triangle material stream the compaction used.
-            voxelizer::bake_leaf_colors(
-                &mut structure,
-                &tree,
-                &mesh,
-                &grid,
-                opts.epsilon,
-                Some(&packed),
-            );
-            eprintln!(
-                "  truecolor baked: {} voxel colours in {:.1}s",
-                structure.leaf_color_words().len(),
-                t.elapsed().as_secs_f64()
-            );
-        } else {
-            eprintln!("  --truecolor ignored: mesh has no textures (rendering palette)");
-        }
+        bake_truecolor_if_textured(
+            &mut structure,
+            &tree,
+            &mesh,
+            &grid,
+            opts.epsilon,
+            &packed,
+            voxels.len(),
+        )?;
     }
     Ok((tree, structure, table))
+}
+
+/// Drop voxels on a glTF MASK material's transparent texels **before** the tree
+/// is built — clearing occupancy after would corrupt `occupied_rank`. BLEND
+/// glass is kept for Phase 2 compositing.
+fn apply_mask_cutout(
+    voxels: &[CompactVoxel],
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    epsilon: f32,
+    packed: &[u32],
+) -> Vec<CompactVoxel> {
+    let kept = voxelizer::cull_mask_cutout(voxels, mesh, grid, epsilon, Some(packed));
+    let dropped = voxels.len() - kept.len();
+    if dropped > 0 {
+        eprintln!("  alpha-cutout dropped {dropped} MASK voxels");
+    }
+    kept
+}
+
+/// Bake per-voxel truecolor into `structure` (docs/materials/11), which routes
+/// the renderer through the truecolor pipeline. Requires a textured glTF (an
+/// untextured mesh bakes flat white, so it keeps the palette path). Rejects an
+/// over-ceiling scene before the multi-hundred-MB CPU bake (C1) — the GPU probe
+/// would reject it at renderer construction anyway, but only after wasted work.
+///
+/// # Errors
+/// Returns an error if the scene exceeds [`voxel_gpu::MAX_TRUECOLOR_VOXELS`].
+fn bake_truecolor_if_textured(
+    structure: &mut SchoolBBuffer,
+    tree: &SparseTree,
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    epsilon: f32,
+    packed: &[u32],
+    voxel_count: usize,
+) -> Result<()> {
+    if mesh.appearance.is_none() {
+        eprintln!("  --truecolor ignored: mesh has no textures (rendering palette)");
+        return Ok(());
+    }
+    if voxel_count > voxel_gpu::MAX_TRUECOLOR_VOXELS {
+        anyhow::bail!(
+            "truecolor scene has {voxel_count} occupied voxels, over the {}-voxel colour \
+             ceiling; lower --res or split the mesh",
+            voxel_gpu::MAX_TRUECOLOR_VOXELS,
+        );
+    }
+    eprintln!("  baking per-voxel truecolor…");
+    let t = Instant::now();
+    // `packed` constrains the colour owner to each voxel's own material so the
+    // bake can't sample a neighbouring surface's texture (the wrong-side bleed);
+    // it's the same per-triangle material stream the compaction used.
+    voxelizer::bake_leaf_colors(structure, tree, mesh, grid, epsilon, Some(packed));
+    eprintln!(
+        "  truecolor baked: {} voxel colours in {:.1}s",
+        structure.leaf_color_words().len(),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Builds the [`SparseTree`] for a noise fixture, evaluating the occupancy on the

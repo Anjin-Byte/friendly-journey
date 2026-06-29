@@ -12,6 +12,11 @@
 // The 2048³ gate's material histogram prints percentages; `usize as f64` loses
 // precision above 2^52 voxels, which is unreachable and irrelevant to a diagnostic.
 #![allow(clippy::cast_precision_loss)]
+// Every test here loads a glTF asset via `load_mesh`, so the whole suite is
+// vacuous (and `load_mesh` is cfg'd out) without a loader feature — gate it like
+// the sibling `loader_robustness`/`obj_robustness` suites so `--no-default-features`
+// compiles cleanly.
+#![cfg(feature = "gltf")]
 
 use glam::Vec3;
 use voxel_core::morton::encode_brick;

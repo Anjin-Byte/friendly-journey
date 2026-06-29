@@ -6,6 +6,9 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+# Application workspace, not a published library — never goes to crates.io. Also
+# lets the supply-chain gate (`cargo xtask ci-deps`) accept the internal path deps.
+publish = false
 
 [[bin]]
 name = "voxel-viewer"

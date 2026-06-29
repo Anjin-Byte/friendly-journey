@@ -282,6 +282,105 @@ mod tests {
         ));
     }
 
+    /// Independent transcription of the GPU `voxelize.wgsl` SAT — the
+    /// `axis_test` / `plane_box_intersects` / `triangle_box_overlap` formulas and
+    /// the 9 edge-cross axes, verbatim — fed the inputs the shader's host
+    /// precompute supplies (world-space plane `normal`/`d` and the triangle AABB).
+    /// Diffing it against the reference [`triangle_box_overlap`] pins the two SAT
+    /// implementations in lockstep: an un-mirrored edit to the shader (a flipped
+    /// axis, a `>` vs `>=`, a sign error) fails the parity test below, so the GPU
+    /// differential cannot pass by the CPU and WGSL being co-buggy. Mirrors the
+    /// `wgsl_rank` transcription guard in `leaf.rs`.
+    // Single-char `a`/`b`/`c`/`d`/`r` mirror the WGSL shader names verbatim.
+    #[allow(clippy::many_single_char_names)]
+    fn wgsl_voxelize_sat(center: Vec3, half: Vec3, a: Vec3, b: Vec3, c: Vec3) -> bool {
+        // Host precompute (per voxelize.wgsl's caller): plane + triangle AABB.
+        let normal = (b - a).cross(c - b);
+        let d = -normal.dot(a);
+        let tri_min = a.min(b).min(c);
+        let tri_max = a.max(b).max(c);
+
+        // --- triangle_box_overlap body (verbatim from voxelize.wgsl) ---
+        let (v0, v1, v2) = (a - center, b - center, c - center);
+        let (e0, e1, e2) = (v1 - v0, v2 - v1, v0 - v2);
+        let box_min = center - half;
+        let box_max = center + half;
+        if tri_min.x > box_max.x || tri_max.x < box_min.x {
+            return false;
+        }
+        if tri_min.y > box_max.y || tri_max.y < box_min.y {
+            return false;
+        }
+        if tri_min.z > box_max.z || tri_max.z < box_min.z {
+            return false;
+        }
+        // plane_box_intersects(normal, d, center, half)
+        let pr = half.x * normal.x.abs() + half.y * normal.y.abs() + half.z * normal.z.abs();
+        if (normal.dot(center) + d).abs() > pr {
+            return false;
+        }
+        // The 9 edge × box-axis cross products.
+        let axes = [
+            Vec3::new(0.0, -e0.z, e0.y),
+            Vec3::new(0.0, -e1.z, e1.y),
+            Vec3::new(0.0, -e2.z, e2.y),
+            Vec3::new(e0.z, 0.0, -e0.x),
+            Vec3::new(e1.z, 0.0, -e1.x),
+            Vec3::new(e2.z, 0.0, -e2.x),
+            Vec3::new(-e0.y, e0.x, 0.0),
+            Vec3::new(-e1.y, e1.x, 0.0),
+            Vec3::new(-e2.y, e2.x, 0.0),
+        ];
+        for axis in axes {
+            let p0 = v0.dot(axis);
+            let p1 = v1.dot(axis);
+            let p2 = v2.dot(axis);
+            let min_p = p0.min(p1).min(p2);
+            let max_p = p0.max(p1).max(p2);
+            let r = half.x * axis.x.abs() + half.y * axis.y.abs() + half.z * axis.z.abs();
+            // WGSL axis_test returns `!(min_p > r || max_p < -r)`.
+            if min_p > r || max_p < -r {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The transcribed GPU SAT must agree with the reference oracle over a fixed
+    /// random corpus. A deterministic LCG (not proptest) avoids shrinking onto a
+    /// measure-zero floating-point tangent where the two algebraically-equal but
+    /// differently-rounded plane tests could disagree by an ULP.
+    #[test]
+    fn wgsl_voxelize_sat_matches_reference() {
+        const N: u32 = 8192;
+        let mut state: u32 = 0x9E37_79B9;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f32::from(u16::try_from(state >> 16).unwrap()) / f32::from(u16::MAX) * 4.0 - 2.0 // [-2, 2]
+        };
+        let mut hits = 0u32;
+        for _ in 0..N {
+            let a = Vec3::new(next(), next(), next());
+            let b = Vec3::new(next(), next(), next());
+            let c = Vec3::new(next(), next(), next());
+            let center = Vec3::new(next(), next(), next()) * 0.5; // [-1, 1]
+            let half = Vec3::splat(0.3 + (next() + 2.0) / 4.0 * 0.5); // [0.3, 0.8]
+            assert_eq!(
+                wgsl_voxelize_sat(center, half, a, b, c),
+                triangle_box_overlap(center, half, a, b, c),
+                "WGSL SAT diverged from the CPU reference: tri {a:?} {b:?} {c:?}, box c={center:?} h={half:?}"
+            );
+            if triangle_box_overlap(center, half, a, b, c) {
+                hits += 1;
+            }
+        }
+        // The corpus must exercise BOTH outcomes or the parity check is vacuous.
+        assert!(
+            hits > 0 && hits < N,
+            "corpus must contain both overlaps and misses (got {hits}/{N})"
+        );
+    }
+
     /// Brute-force oracle: marks every voxel of an `n³` grid whose unit cube the
     /// SAT says overlaps any triangle (grid space == world). The voxelizer's
     /// AABB-scan output must equal this exhaustive set.

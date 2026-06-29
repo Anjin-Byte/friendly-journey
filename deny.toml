@@ -1,0 +1,61 @@
+# cargo-deny configuration — the supply-chain gate run by `cargo xtask ci-deps`.
+#
+# This is opt-in (not part of the always-green `cargo xtask ci`) and exists
+# because the workspace links untrusted byte-parsers (gltf / tobj / stl_io /
+# image) that ingest arbitrary user files. See tools/xtask/src/main.rs.
+#
+# Run: `cargo install --locked cargo-deny` then `cargo xtask ci-deps`.
+
+[graph]
+# Check the host target the renderer actually runs on (plus the wasm debug path).
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "wasm32-unknown-unknown" },
+]
+
+[advisories]
+version = 2
+# RustSec advisories: a known vulnerability fails the gate; an unmaintained or
+# yanked crate is surfaced as a warning (review, don't hard-block, on an
+# unpublished single-author tool).
+yanked = "warn"
+ignore = []
+
+[licenses]
+version = 2
+# The permissive licenses present across the wgpu / winit / glam dependency tree.
+# The workspace itself is "MIT OR Apache-2.0". A crate with a license not listed
+# here fails the gate — add it deliberately after reviewing it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are common in big graphics trees; surface but don't block.
+multiple-versions = "warn"
+# A registry wildcard ("*") dependency is a real footgun — deny it. But the
+# workspace's own internal crates are path deps (which resolve to "*"), so allow
+# path-based wildcards: those are intentional, not an unpinned external version.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only the public crates.io registry; no unknown registries or git sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
