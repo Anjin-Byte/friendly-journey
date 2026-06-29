@@ -18,10 +18,14 @@ targets = [
 
 [advisories]
 version = 2
-# RustSec advisories: a known vulnerability fails the gate; an unmaintained or
-# yanked crate is surfaced as a warning (review, don't hard-block, on an
-# unpublished single-author tool).
+# RustSec advisories: a known *vulnerability* always fails the gate. `yanked`
+# crates warn (review, don't hard-block, on an unpublished single-author tool).
+# `unmaintained` is scoped to "workspace": an unmaintained advisory fails only
+# for a crate WE depend on directly, not a deep transitive we don't control
+# (e.g. `ttf-parser` via `winit`, RUSTSEC-2026-0192 — unfixable upstream, would
+# otherwise red the gate). cargo-deny v2 defaults this to "all"; narrow it here.
 yanked = "warn"
+unmaintained = "workspace"
 ignore = []
 
 [licenses]
