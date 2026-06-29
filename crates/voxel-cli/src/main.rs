@@ -1,8 +1,11 @@
 //! `voxel` — headless CLI for the sparse MIP voxel structure.
 //!
 //! Orchestration only (argument parsing, I/O, reporting); all domain logic
-//! lives in [`voxel_core`] and the GPU path in [`voxel_gpu`]. Backend selection
-//! is a runtime `--backend cpu|gpu|auto` flag, never a Cargo feature.
+//! lives in [`voxel_core`], the GPU path in [`voxel_gpu`], and mesh voxelization
+//! in [`voxelizer`]. Backend selection is a runtime `--backend cpu|gpu|auto`
+//! flag, never a Cargo feature.
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -13,6 +16,11 @@ use voxel_core::{
     mirror_traverse,
 };
 use voxel_gpu::{GpuContext, GpuError, GpuRenderer, GpuTraverser};
+use voxelizer::reference_cpu::voxelize_surface_cpu;
+use voxelizer::{
+    GpuVoxelizer, GpuVoxelizerConfig, MeshInput, TileSpec, VoxelGrid, VoxelOccupancy, VoxelizeOpts,
+};
+use voxelizer::{load_mesh, rotation_degrees};
 
 #[derive(Parser)]
 #[command(name = "voxel", about = "Sparse MIP voxel structure — headless tools")]
@@ -44,6 +52,43 @@ enum Command {
     /// step that confirms whether the floor is the cold leaf-miss latency. See
     /// `CAPTURE.md`.
     Capture(CaptureArgs),
+    /// Voxelize a mesh file (`.gltf`/`.glb`, `.obj`, `.stl`) into the sparse
+    /// structure and report it; `--diff` cross-checks the GPU voxelizer against
+    /// the CPU oracle.
+    Voxelize(VoxelizeArgs),
+}
+
+#[derive(Args)]
+struct VoxelizeArgs {
+    /// Mesh file to voxelize. Format is chosen by extension (`.gltf`/`.glb`,
+    /// `.obj`, `.stl`).
+    #[arg(long)]
+    input: PathBuf,
+    /// Grid resolution per axis (must be `8·4^k`: 8, 32, 128, 512, 2048, …).
+    #[arg(long, default_value_t = 128)]
+    res: u32,
+    /// Voxels of margin to leave around the mesh's bounding box when fitting it
+    /// into the cubic grid.
+    #[arg(long, default_value_t = 2.0)]
+    padding: f32,
+    /// Corrective rotation about X in degrees, applied before fitting the grid.
+    /// Re-orients transform-less formats (OBJ/STL) whose exporter used a
+    /// different up-axis (e.g. `--rotate-x -90` for a Z-up model in a Y-up view).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_x: f32,
+    /// Corrective rotation about Y in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_y: f32,
+    /// Corrective rotation about Z in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_z: f32,
+    /// Which voxelizer to run.
+    #[arg(long, value_enum, default_value_t = Backend::Auto)]
+    backend: Backend,
+    /// Run BOTH the CPU oracle and the GPU path and report their agreement (the
+    /// Reference-as-Oracle conservative-superset check) instead of a plain build.
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Args)]
@@ -208,6 +253,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Capture(args) => capture_cmd(&args),
+        Command::Voxelize(args) => voxelize_cmd(&args),
     }
 }
 
@@ -290,6 +336,7 @@ fn time_class_costs(tree: &SparseTree, n: u32, edits: u32, state: &mut u64) -> C
                 topo.1 += 1;
             }
             Edit::Unchanged => {}
+            Edit::Material { .. } => unreachable!("set_voxel never returns Material"), // occupancy edits only — set_voxel never spills materials
         }
     }
     let (leaf_s, leaf_batch) = time_leaf_batch(tree.clone(), n, edits.max(50_000), state);
@@ -399,6 +446,7 @@ fn time_brush_stamps(
                     any_topo = true;
                 }
                 Edit::Unchanged => {}
+                Edit::Material { .. } => unreachable!("set_voxel never returns Material"), // occupancy edits only
             }
         }
         s.total += t.elapsed();
@@ -424,12 +472,14 @@ fn time_brush_stamps(
 /// Returns `(µs per leaf patch, ms per full re-upload)`.
 fn time_gpu_patch(ctx: &GpuContext, tree: &SparseTree) -> Result<(f64, f64)> {
     let structure = SchoolBBuffer::from_sparse(tree);
-    let mut renderer = GpuRenderer::new(ctx, &structure)?;
+    // Edit-timing bench: occupancy only, so the magenta-only table is fine.
+    let mut renderer =
+        GpuRenderer::new(ctx, &structure, &voxel_core::MaterialTable::missing_only())?;
 
     let patches = 10_000u32;
     let t = std::time::Instant::now();
     for _ in 0..patches {
-        renderer.update_leaf(&structure, 0); // re-stage leaf 0's words (O(1))
+        let _ = renderer.update_leaf(&structure, 0); // re-stage leaf 0's words (O(1)); palette → infallible
     }
     let leaf_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(patches);
 
@@ -1145,4 +1195,203 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
 
 fn fmt_dir(d: DVec3) -> String {
     format!("[{:+.2},{:+.2},{:+.2}]", d.x, d.y, d.z)
+}
+
+fn voxelize_cmd(args: &VoxelizeArgs) -> Result<()> {
+    let resolution = Resolution::new(args.res)?;
+    let mut mesh =
+        load_mesh(&args.input).with_context(|| format!("loading mesh {}", args.input.display()))?;
+    // Re-orient transform-less formats before measuring the bounding box.
+    if args.rotate_x != 0.0 || args.rotate_y != 0.0 || args.rotate_z != 0.0 {
+        mesh.transform(rotation_degrees(
+            args.rotate_x,
+            args.rotate_y,
+            args.rotate_z,
+        ));
+    }
+    tracing::info!(
+        triangles = mesh.triangles.len(),
+        n = resolution.voxels_per_axis(),
+        "mesh loaded"
+    );
+
+    // Fit the mesh into the cubic grid; tile for the GPU dispatch.
+    let grid = VoxelGrid::fit_mesh(resolution, &mesh, args.padding);
+    let tiles = TileSpec::new([4, 4, 4], grid.dims())?;
+    // Occupancy-only: this command consumes only the bitset (→ SparseTree), so
+    // skip the per-voxel owner/color buffers, which would be n³·4 bytes each and
+    // exceed the storage limit at n ≥ 512.
+    let opts = VoxelizeOpts {
+        epsilon: 1e-4,
+        store_owner: false,
+        store_color: false,
+    };
+
+    if args.diff {
+        return voxelize_diff(&mesh, &grid, &tiles, &opts);
+    }
+
+    let (label, occupancy) = run_voxelize_backend(args.backend, &mesh, &grid, &tiles, &opts)?;
+
+    // Bridge to the renderer's structures (the whole point of the native output).
+    let tree = occupancy.to_sparse_tree();
+    let structure = SchoolBBuffer::from_sparse(&tree);
+
+    let n = resolution.voxels_per_axis();
+    println!("voxelize [{label}] {}", args.input.display());
+    println!("  mesh:      {} triangles", mesh.triangles.len());
+    println!("  grid:      {n}³  (voxel_size {:.5})", grid.voxel_size);
+    println!("  occupied:  {} voxels", occupancy.count_occupied());
+    println!(
+        "  structure: {} sparse nodes, {} leaves; {} School-B nodes",
+        tree.node_count(),
+        tree.leaf_count(),
+        structure.node_count()
+    );
+    Ok(())
+}
+
+/// Runs the selected voxelizer backend, returning a label and the occupancy.
+fn run_voxelize_backend(
+    backend: Backend,
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    tiles: &TileSpec,
+    opts: &VoxelizeOpts,
+) -> Result<(&'static str, VoxelOccupancy)> {
+    let cpu = || {
+        (
+            "cpu-oracle",
+            voxelize_surface_cpu(mesh, grid, tiles, opts).occupancy,
+        )
+    };
+
+    match backend {
+        Backend::Cpu => Ok(cpu()),
+        Backend::Gpu => {
+            let ctx = GpuContext::try_new().context("no GPU; use --backend cpu or auto")?;
+            Ok(("gpu", voxelize_gpu(&ctx, mesh, grid, tiles, opts)?))
+        }
+        Backend::Auto => match GpuContext::try_new() {
+            Ok(ctx) => Ok(("gpu", voxelize_gpu(&ctx, mesh, grid, tiles, opts)?)),
+            Err(GpuError::NoAdapter) => {
+                tracing::info!("no GPU adapter; using the CPU oracle");
+                Ok(cpu())
+            }
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
+/// Voxelizes on the GPU, sharing the renderer's device via `from_device` (one GPU
+/// for both the voxelizer and the renderer).
+fn voxelize_gpu(
+    ctx: &GpuContext,
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    tiles: &TileSpec,
+    opts: &VoxelizeOpts,
+) -> Result<VoxelOccupancy> {
+    let vox = pollster::block_on(GpuVoxelizer::from_device(
+        &ctx.device,
+        &ctx.queue,
+        GpuVoxelizerConfig::default(),
+    ))?;
+    let out = pollster::block_on(vox.voxelize_surface(mesh, grid, tiles, opts))?;
+    Ok(out.occupancy)
+}
+
+/// Cross-checks the GPU voxelizer against the CPU SAT oracle on the same mesh: the
+/// GPU must be a *conservative superset* (never under-mark) — Engineering Codex:
+/// Reference Implementation as Oracle.
+fn voxelize_diff(
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    tiles: &TileSpec,
+    opts: &VoxelizeOpts,
+) -> Result<()> {
+    let ctx = GpuContext::try_new().context("--diff requires a GPU")?;
+    let cpu = voxelize_surface_cpu(mesh, grid, tiles, opts).occupancy;
+    let gpu = voxelize_gpu(&ctx, mesh, grid, tiles, opts)?;
+
+    let mut under = 0u64; // CPU-marked but GPU-missed — must be 0
+    let mut over = 0u64; // GPU over-marked — a small FP-tangent margin only
+    for (c, g) in cpu.words().iter().zip(gpu.words()) {
+        under += u64::from((c & !g).count_ones());
+        over += u64::from((g & !c).count_ones());
+    }
+
+    println!(
+        "voxelize diff (CPU oracle vs GPU): {} CPU-occupied, {} GPU-occupied",
+        cpu.count_occupied(),
+        gpu.count_occupied()
+    );
+    println!("  CPU∖GPU (under-marks, must be 0): {under}");
+    println!("  GPU∖CPU (FP-tangent over-marks):  {over}");
+    if under == 0 {
+        println!("  ✓ GPU is a conservative superset of the CPU oracle (no under-marking).");
+        Ok(())
+    } else {
+        anyhow::bail!("GPU under-marked {under} voxels — a real divergence, not a tangent effect")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn res8() -> Resolution {
+        Resolution::new(8).unwrap()
+    }
+
+    /// `build_tree` produces a non-empty structure whose occupancy matches the
+    /// fixture: a `Solid` 8³ grid is one fully-occupied leaf.
+    #[test]
+    fn build_tree_solid_is_one_full_leaf() {
+        let tree = build_tree(Fixture::Solid, res8());
+        assert_eq!(tree.leaf_count(), 1, "an 8³ Solid is a single brick");
+        assert!(tree.is_occupied(VoxelCoord::new(0, 0, 0)));
+        assert!(tree.is_occupied(VoxelCoord::new(7, 7, 7)));
+    }
+
+    /// A sparse fixture builds a non-empty tree that is not fully solid (proving
+    /// `build_tree` dispatches to the real fixture, not a constant).
+    #[test]
+    fn build_tree_sierpinski_is_sparse_nonempty() {
+        let tree = build_tree(Fixture::Sierpinski, Resolution::new(32).unwrap());
+        assert!(tree.leaf_count() > 0, "sierpinski occupies some voxels");
+        let n = tree.resolution().voxels_per_axis();
+        let occupied = (0..n)
+            .flat_map(|z| (0..n).flat_map(move |y| (0..n).map(move |x| (x, y, z))))
+            .filter(|&(x, y, z)| tree.is_occupied(VoxelCoord::new(x, y, z)))
+            .count();
+        assert!(occupied > 0, "some voxels occupied");
+        assert!(
+            occupied < (n * n * n) as usize,
+            "sierpinski is sparse, not solid"
+        );
+    }
+
+    /// `camera_rays` returns exactly `count` rays with finite, non-degenerate
+    /// directions, and is deterministic (the splitmix64 stream is seeded).
+    #[test]
+    fn camera_rays_count_finite_and_deterministic() {
+        let rays = camera_rays(res8(), 256);
+        assert_eq!(rays.len(), 256);
+        for r in &rays {
+            assert!(r.origin.is_finite(), "ray origin must be finite");
+            assert!(
+                r.dir.length() > 1e-6 && r.dir.is_finite(),
+                "ray direction must be finite and non-degenerate"
+            );
+        }
+        // Deterministic: same seed → identical rays.
+        let again = camera_rays(res8(), 256);
+        assert!(
+            rays.iter()
+                .zip(&again)
+                .all(|(a, b)| a.origin == b.origin && a.dir == b.dir),
+            "camera_rays must be deterministic"
+        );
+    }
 }

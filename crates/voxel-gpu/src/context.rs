@@ -73,4 +73,19 @@ impl GpuContext {
     pub fn max_storage_binding(&self) -> u64 {
         self.device.limits().max_storage_buffer_binding_size
     }
+
+    /// The adapter's whole-buffer size cap (`max_buffer_size`) — the second ceiling
+    /// the truecolor chunk probe checks alongside the per-binding cap.
+    #[must_use]
+    pub fn max_buffer_size(&self) -> u64 {
+        self.device.limits().max_buffer_size
+    }
+
+    /// The granted number of storage buffers per shader stage (stock wgpu default
+    /// is 8). The truecolor layout needs 7; the probe fails loudly on a degraded
+    /// adapter reporting fewer.
+    #[must_use]
+    pub fn max_storage_buffers(&self) -> u32 {
+        self.device.limits().max_storage_buffers_per_shader_stage
+    }
 }

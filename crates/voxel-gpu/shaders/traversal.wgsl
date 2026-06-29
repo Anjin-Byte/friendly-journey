@@ -202,14 +202,27 @@ fn walker_step(f: ptr<function, Frame>) -> bool {
 /// Marches one ray through the structure. Returns `(vx, vy, vz, 1)` for the
 /// first occupied voxel, or `(0, 0, 0, 0)` for a miss.
 ///
+/// The result of a primary-ray traversal: `world` is the hit voxel's world
+/// coordinate (unchanged semantics); `leaf` (leaf slot, index-parallel with
+/// `leaves`/`leaf_bounds`) and `vox` (intra-leaf morton index, 0..511) are
+/// plumbed for the cold material read at the hit. `hit` is 1 on a hit, else 0.
+struct HitResult {
+    world: vec3<u32>,
+    hit: u32,
+    leaf: u32,
+    vox: u32,
+}
+
 /// The *active* DDA frame is kept in function-local (register-resident) scalars;
 /// the `stack` array holds only its ancestors, touched on descend/ascend rather
 /// than on every cell-step. Same algorithm as voxel-core's `mirror.rs` (only the
 /// active frame's storage differs) — it traverses ~1.8× faster than indexing
 /// `stack[top]` each step, which spilled the frame array to GPU local memory.
 /// Validated byte-identical to that stack form by the differential.
-fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
-    let miss = vec4<u32>(0u, 0u, 0u, 0u);
+fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> HitResult {
+    // NOTE: do NOT bind a `let miss` here — a struct held across the loop would
+    // add registers to the hot probe loop's live set (measured +30% on the
+    // cheapest orientation). Rematerialize the all-zero miss at each return.
 
     // Grid-clip (f32 slab) against [0, n]³ — identical to traverse_ray.
     var t_near = -BIG;
@@ -223,7 +236,7 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
     else { let inv = 1.0 / d.z; var a = (0.0 - o.z) * inv; var b = (n - o.z) * inv; if (a > b) { let t = a; a = b; b = t; } t_near = max(t_near, a); t_far = min(t_far, b); }
 
     if (missed || t_near > t_far || t_far < 0.0) {
-        return miss;
+        return HitResult(vec3<u32>(0u, 0u, 0u), 0u, 0u, 0u);
     }
     let t_entry = max(t_near, 0.0);
 
@@ -243,12 +256,20 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
             let v = cur.cell;
             if (leaf_bit(cur.node, v)) {
                 let org = cur.origin;
-                return vec4<u32>(org.x + v.x, org.y + v.y, org.z + v.z, 1u);
+                // leaf/vox computed INSIDE the hit branch so their live range
+                // never enters the hot probe loop; vox uses the SAME morton8 as
+                // leaf_bit (line ~30/56) — the identical intra-leaf voxel order.
+                return HitResult(
+                    vec3<u32>(org.x + v.x, org.y + v.y, org.z + v.z),
+                    1u,
+                    cur.node,
+                    morton8(v & vec3<u32>(7u)),
+                );
             }
             if (walker_step(&cur)) { continue; }
             // Ascend: pop a parent into `cur` and step it.
             loop {
-                if (sp == 0u) { return miss; }
+                if (sp == 0u) { return HitResult(vec3<u32>(0u, 0u, 0u), 0u, 0u, 0u); }
                 sp = sp - 1u;
                 cur = stack[sp];
                 if (walker_step(&cur)) { break; }
@@ -274,7 +295,7 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
                 cur = make_frame(o, d, slot, child_level, child_origin, cur.t_entry);
             } else if (!walker_step(&cur)) {
                 loop {
-                    if (sp == 0u) { return miss; }
+                    if (sp == 0u) { return HitResult(vec3<u32>(0u, 0u, 0u), 0u, 0u, 0u); }
                     sp = sp - 1u;
                     cur = stack[sp];
                     if (walker_step(&cur)) { break; }
@@ -282,5 +303,5 @@ fn traverse_ray(o: vec3<f32>, d: vec3<f32>, n: f32, k: u32) -> vec4<u32> {
             }
         }
     }
-    return miss;
+    return HitResult(vec3<u32>(0u, 0u, 0u), 0u, 0u, 0u);
 }

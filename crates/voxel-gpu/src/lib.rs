@@ -19,6 +19,7 @@ mod generate;
 mod render;
 mod traverse;
 
+pub use buffers::MAX_TRUECOLOR_VOXELS;
 pub use capture::capture_gputrace;
 pub use context::GpuContext;
 pub use error::GpuError;

@@ -16,6 +16,7 @@ repository = "https://github.com/Anjin-Byte/friendly-journey"
 # Internal crates (path deps; the dependency graph runs inward toward voxel-core).
 voxel-core = { path = "crates/voxel-core" }
 voxel-gpu = { path = "crates/voxel-gpu" }
+voxelizer = { path = "crates/voxelizer" }
 
 # Shared external deps. Pinned here so members stay uniform; wgpu/winit are
 # version-churny and MUST be pinned centrally (adversarial review R6).
@@ -31,6 +32,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 radsort = "0.1"
+gltf = "1.4"
+tobj = "4"
+# OBJ texture decoding (the `gltf` crate decodes its own images; `tobj` only
+# hands back the map_Kd path string, so the OBJ adapter decodes the file itself).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+stl_io = "0.11"
 
 # Lints are centralized in the root manifest; every member inherits via
 # `[lints] workspace = true` (Engineering Codex: Workspace Lints and Profiles).
@@ -47,6 +54,12 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"   # error contracts are expressed by the thiserror enums themselves.
 missing_panics_doc = "allow"
+# The footgun lints `unwrap_used` / `expect_used` are intentionally NOT enabled.
+# This codebase uses deliberate, proof-carrying `expect("…")` messages as inline
+# correctness arguments (e.g. `expect("masked to 16 bits")` next to the mask that
+# guarantees it) — ~150+ such sites across the core crates. A blanket lint would
+# force an `#[allow]` at each for no real safety gain, so the discipline here is
+# "every panic-site carries a written justification", enforced by review, not a lint.
 
 # Profiles are only recognized in the root manifest.
 [profile.dev]

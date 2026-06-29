@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Supersede in-flight runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The always-green floor: fmt --check, clippy -D warnings, the voxelizer
+  # feature-matrix lane, test --all-targets, doctests, and doc — all via the
+  # `cargo xtask ci` gate (the single source of truth, identical to the local
+  # gate). Runs on macOS to mirror the development environment where the gate is
+  # verified. GPU differential tests skip automatically when no adapter is
+  # present (VOXEL_REQUIRE_GPU is intentionally unset here); the GPU gate is
+  # `cargo xtask ci-gpu`, run locally on a Metal host before merge — see
+  # CONTRIBUTING.md.
+  ci:
+    name: cargo xtask ci
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask -- ci
+
+  # Supply-chain audit (advisories / bans / licenses / sources) against the
+  # committed deny.toml — the same check `cargo xtask ci-deps` runs locally,
+  # via the cached cargo-deny action. Platform-agnostic, so cheapest runner.
+  supply-chain:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

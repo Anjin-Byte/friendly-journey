@@ -20,6 +20,40 @@ struct Camera {
 
 @group(0) @binding(3) var<uniform> camera: Camera;
 @group(0) @binding(4) var output: texture_storage_2d<rgba8unorm, write>;
+// Per-leaf packed material slots (STRIDE_W u32 each) and the global colour table.
+// Read once cold at the hit only — never on the hot occupancy probe.
+@group(0) @binding(5) var<storage, read> leaf_mat: array<u32>;
+@group(0) @binding(6) var<storage, read> material_table: array<u32>;
+
+// Mirrors voxel_core::palette (STRIDE_W=73, PAL_OFF=1, IDX_OFF=9). Pinned to the
+// CPU packer by the wgsl_bit_layout_matches_pack parity test.
+const MAT_STRIDE_W: u32 = 73u;
+const MAT_PAL_OFF: u32 = 1u;
+const MAT_IDX_OFF: u32 = 9u;
+
+// The global material id at leaf slot `s`, intra-brick morton voxel `m`. This is
+// the second implementation of the bit layout the CPU `pack_leaf` writes (see
+// docs/materials/03-gpu-read.md §2 and the parity test). A `bits == 0` slot — a
+// single-material leaf OR the deferred uniform-magenta spill — reads palette
+// slot 0 for every voxel; the `bits == 0` short-circuit is mandatory because the
+// mask `(1u << 0u) - 1u` is degenerate.
+fn read_material(s: u32, m: u32) -> u32 {
+    let base = s * MAT_STRIDE_W;
+    let bits = leaf_mat[base] & 0xFu; // bits_per_voxel
+    var pi: u32 = 0u;
+    if (bits != 0u) {
+        let off = m * bits;
+        let iw = base + MAT_IDX_OFF + (off >> 5u);
+        let pos = off & 31u;
+        pi = leaf_mat[iw] >> pos;
+        if (pos + bits > 32u) { // straddles a 32-bit word (vs the reference's 64)
+            pi = pi | (leaf_mat[iw + 1u] << (32u - pos));
+        }
+        pi = pi & ((1u << bits) - 1u);
+    }
+    let pal_word = leaf_mat[base + MAT_PAL_OFF + (pi >> 1u)];
+    return (pal_word >> (16u * (pi & 1u))) & 0xFFFFu; // u16 low/high half-select
+}
 
 @compute @workgroup_size(8, 8)
 fn render_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -38,9 +72,17 @@ fn render_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hit = traverse_ray(camera.eye, dir, camera.n, camera.dims.z);
 
     var color: vec4<f32>;
-    if (hit.w == 1u) {
-        // Shade by voxel position, with a touch of depth-ish dimming via y.
-        color = vec4<f32>(f32(hit.x) / camera.n, f32(hit.y) / camera.n, f32(hit.z) / camera.n, 1.0);
+    if (hit.hit == 1u) {
+        // One cold material read at the hit (hit.leaf = slot, hit.vox = morton).
+        let mat_id = read_material(hit.leaf, hit.vox);
+        if (mat_id == 0u) {
+            // global-0 = no material (occupancy-only fixture, or an unresolved
+            // voxel): fall back to position shading, the prior look.
+            color = vec4<f32>(f32(hit.world.x) / camera.n, f32(hit.world.y) / camera.n, f32(hit.world.z) / camera.n, 1.0);
+        } else {
+            // Real material: RGBA8 colour from the global table (R in low byte).
+            color = unpack4x8unorm(material_table[mat_id]);
+        }
     } else {
         let t = f32(gid.y) / h;
         color = vec4<f32>(0.08 * (1.0 - t), 0.10 * (1.0 - t), 0.16 + 0.12 * t, 1.0);

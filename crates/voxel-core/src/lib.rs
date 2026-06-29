@@ -33,6 +33,7 @@ pub mod mirror;
 pub mod morton;
 pub mod node;
 pub mod oracle;
+pub mod palette;
 pub mod school_b;
 pub mod sparse;
 
@@ -54,6 +55,10 @@ pub use mirror::mirror_traverse;
 pub use node::GpuNode;
 pub use occupancy::{BitGrid, OccupancyField};
 pub use oracle::Hit;
+pub use palette::{
+    LeafMaterials, MISSING_MAGENTA, MaterialError, MaterialTable, PaletteError, bits_required,
+    pack_leaf, read_slot,
+};
 pub use ray::{Ray, ray_aabb};
 pub use resolution::{Resolution, ResolutionError};
 pub use school_b::SchoolBBuffer;

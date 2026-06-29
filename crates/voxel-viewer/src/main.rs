@@ -14,6 +14,11 @@
 //! manual input hands control to the fly camera; `Tab` toggles back. The HUD
 //! (`H` to toggle) shows FPS, frame/kernel times, scene info, and a frame-time
 //! sparkline — so the orientation cost swing is visible while orbiting.
+//!
+//! **Exit code:** initialization failure (a bad `--mesh`, an invalid `--res`, or
+//! a GPU device request that is refused) makes the process exit **non-zero**, so
+//! a non-interactive `--frames` run can detect a failed load. A clean shutdown
+//! (window closed, or `--frames` budget reached) exits zero.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -25,17 +30,23 @@ mod camera;
 mod hud;
 mod input;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use voxel_core::fixtures::{Checkerboard, Dust, NoiseField, OctantFractal, WireLattice};
 use voxel_core::{
-    Edit, Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, brush_voxels, traverse,
+    Edit, MaterialTable, Ray, Resolution, SchoolBBuffer, SparseTree, VoxelCoord, brush_voxels,
+    traverse,
 };
 use voxel_gpu::{GpuCamera, GpuContext, GpuRenderer};
+use voxelizer::{
+    CompactVoxel, GpuVoxelizer, GpuVoxelizerConfig, MeshInput, VoxelGrid, VoxelizeOpts,
+};
+use voxelizer::{load_mesh, rotation_degrees};
 use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -49,7 +60,7 @@ use camera::{FlyCamera, orbit_camera, orbit_eye_forward};
 use hud::{Hud, HudBuilder};
 use input::Input;
 
-#[derive(Parser, Clone, Copy)]
+#[derive(Parser, Clone)]
 #[command(
     name = "voxel-viewer",
     about = "Render the sparse MIP voxel structure on the GPU"
@@ -59,14 +70,39 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     res: u32,
     /// Window width in pixels (one primary ray per pixel).
-    #[arg(long, default_value_t = 800)]
+    #[arg(long, default_value_t = 2560)]
     width: u32,
     /// Window height in pixels.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 1080)]
     height: u32,
-    /// Occupancy fixture to render.
+    /// Occupancy fixture to render (used when `--mesh` is not given).
     #[arg(long, value_enum, default_value_t = Fixture::Sierpinski)]
     fixture: Fixture,
+    /// Mesh file to voxelize and render (`.gltf`/`.glb`, `.obj`, `.stl`). When
+    /// set, the mesh is voxelized into the grid instead of building `--fixture`.
+    #[arg(long)]
+    mesh: Option<PathBuf>,
+    /// Bake per-voxel **truecolor** from the mesh's textures and render with the
+    /// truecolor pipeline (textured glTF only; ignored for untextured meshes). The
+    /// bake is build-once, so interactive editing is disabled in this mode.
+    #[arg(long)]
+    truecolor: bool,
+    /// Voxels of margin around the mesh's bounding box when fitting it into the
+    /// grid (only used with `--mesh`).
+    #[arg(long, default_value_t = 2.0)]
+    padding: f32,
+    /// Corrective rotation about X in degrees, applied to `--mesh` before fitting
+    /// the grid. Re-orients transform-less formats (OBJ/STL) whose exporter used
+    /// a different up-axis (e.g. `--rotate-x -90` for a Z-up model in this Y-up
+    /// view).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_x: f32,
+    /// Corrective rotation about Y in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_y: f32,
+    /// Corrective rotation about Z in degrees (see `--rotate-x`).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    rotate_z: f32,
     /// Cap the frame rate to the display refresh (off by default, so the
     /// profile reflects raw GPU throughput).
     #[arg(long)]
@@ -132,23 +168,38 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let mut app = App { args, state: None };
+    let mut app = App {
+        args,
+        state: None,
+        init_error: None,
+    };
     event_loop.run_app(&mut app)?;
+    // `resumed` exits the loop cleanly even when init *fails*, so `run_app`
+    // returns `Ok`. Re-raise a stored init error here so the process exits
+    // non-zero — otherwise a scripted/`--frames` run cannot tell a failed load
+    // (bad mesh, bad `--res`, GPU init failure) from a successful one.
+    if let Some(e) = app.init_error {
+        return Err(e);
+    }
     Ok(())
 }
 
 struct App {
     args: Args,
     state: Option<Viewer>,
+    /// Captures a `Viewer::new` failure from `resumed` so `main` can surface it
+    /// as a non-zero exit after the event loop returns (see `main`).
+    init_error: Option<anyhow::Error>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
-            match Viewer::new(event_loop, self.args) {
+            match Viewer::new(event_loop, &self.args) {
                 Ok(v) => self.state = Some(v),
                 Err(e) => {
                     eprintln!("viewer init failed: {e:?}");
+                    self.init_error = Some(e);
                     event_loop.exit();
                 }
             }
@@ -227,7 +278,8 @@ struct Viewer {
     hud: Hud,
     show_hud: bool,
     resolution: Resolution,
-    fixture: Fixture,
+    /// HUD label for the current scene: the fixture name, or the mesh filename.
+    scene_label: String,
     node_count: usize,
     leaf_count: usize,
     // Editing: the live tree + its School-B buffer, kept CPU-side so an edit can
@@ -235,6 +287,9 @@ struct Viewer {
     // for an in-place edit, full re-upload on topology change).
     tree: SparseTree,
     structure: SchoolBBuffer,
+    /// Whether the renderer is in build-once truecolor mode (interactive editing
+    /// is disabled, since the colour bake cannot be patched per-edit).
+    truecolor: bool,
     cursor: (f32, f32),
     brush_radius: u32,
     brush_add: bool,
@@ -264,7 +319,7 @@ impl Viewer {
     // Inherently long: one-shot setup of window, surface, adapter, device,
     // structure, render pipeline, blit pipeline, and HUD.
     #[allow(clippy::too_many_lines)]
-    fn new(event_loop: &ActiveEventLoop, args: Args) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, args: &Args) -> Result<Self> {
         let attrs = Window::default_attributes()
             .with_title("voxel-viewer — sparse MIP HDDA on the GPU")
             .with_inner_size(winit::dpi::LogicalSize::new(args.width, args.height));
@@ -321,16 +376,58 @@ impl Viewer {
         };
         surface.configure(&device, &config);
 
-        // Build the structure. Noise fixtures generate their occupancy on the GPU
-        // (≈17× faster than the parallel CPU build at 512³); the tree is kept
-        // alongside its buffer so edits can patch both.
+        // Build the structure: either voxelize a mesh file (sharing this GPU via
+        // `from_device`) or generate the chosen fixture. Noise fixtures generate
+        // their occupancy on the GPU (≈17× faster than the CPU build at 512³); the
+        // tree is kept alongside its buffer so edits can patch both.
         let ctx = GpuContext { device, queue };
         let resolution = Resolution::new(args.res)?;
-        eprintln!("building {}³ structure…", resolution.voxels_per_axis());
-        let (tree, structure) = build_structure(&ctx, resolution, args.fixture);
+        let (scene_label, tree, structure, table) = if let Some(mesh_path) = args.mesh.as_deref() {
+            let label = mesh_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("MESH")
+                .to_string();
+            eprintln!(
+                "voxelizing {} into a {}³ grid…",
+                mesh_path.display(),
+                resolution.voxels_per_axis()
+            );
+            let (tree, structure, table) = build_from_mesh(
+                &ctx,
+                resolution,
+                mesh_path,
+                args.padding,
+                rotation_degrees(args.rotate_x, args.rotate_y, args.rotate_z),
+                args.truecolor,
+            )?;
+            // Mark the HUD label when the truecolor bake actually took effect.
+            let label = if structure.has_leaf_color() {
+                format!("{label} (TRUECOLOR)")
+            } else {
+                label
+            };
+            (label, tree, structure, table)
+        } else {
+            eprintln!(
+                "building {}³ {} structure…",
+                resolution.voxels_per_axis(),
+                args.fixture.label()
+            );
+            // Fixtures carry no materials: the magenta-only table makes every hit
+            // global-0, which the shader shades by position (the prior look).
+            let (tree, structure) = build_structure(&ctx, resolution, args.fixture);
+            (
+                args.fixture.label().to_string(),
+                tree,
+                structure,
+                MaterialTable::missing_only(),
+            )
+        };
         let (node_count, leaf_count) = (tree.node_count(), tree.leaf_count());
+        let truecolor = structure.has_leaf_color();
 
-        let renderer = GpuRenderer::new(&ctx, &structure)?;
+        let renderer = GpuRenderer::new(&ctx, &structure, &table)?;
 
         // Blit pipeline + the intermediate render-output texture + the HUD.
         let (blit_pipeline, blit_layout, sampler) = build_blit(&ctx.device, format);
@@ -363,11 +460,12 @@ impl Viewer {
             hud,
             show_hud: true,
             resolution,
-            fixture: args.fixture,
+            scene_label,
             node_count,
             leaf_count,
             tree,
             structure,
+            truecolor,
             cursor: (0.0, 0.0),
             brush_radius: 3,
             brush_add: true,
@@ -510,6 +608,12 @@ impl Viewer {
     /// render kernel's ray-gen exactly so the edit lands where it is drawn), and
     /// if it hits a voxel, stamps the current brush there.
     fn edit_at_cursor(&mut self) {
+        if self.truecolor {
+            // Truecolor is build-once: the per-voxel colour bake (nearest-surface
+            // over the mesh) can't be patched per edit, and the GPU colour buffers
+            // reject in-place writes. Disable editing rather than corrupt the bake.
+            return;
+        }
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         if w <= 0.0 || h <= 0.0 {
             return;
@@ -549,6 +653,9 @@ impl Viewer {
                     any_topology = true;
                     changed += 1;
                 }
+                // Occupancy edits only here; material edits come via set_material
+                // and a material patch once the leaf_mat buffer lands (milestone 5).
+                Edit::Material { .. } => unreachable!("set_voxel never returns Material"),
             }
         }
 
@@ -568,6 +675,9 @@ impl Viewer {
                 touched.dedup();
                 for &idx in &touched {
                     self.structure.patch_leaf(&self.tree, idx);
+                    // Keep the material slot in step: a brush-added voxel defaults
+                    // to global-0 (the stale-bits fix), so its colour must follow.
+                    self.structure.patch_leaf_mat(&self.tree, idx);
                 }
                 if self.needs_full_upload {
                     // A prior topology re-upload failed, so the renderer's buffers
@@ -576,7 +686,11 @@ impl Viewer {
                     self.sync_renderer_full();
                 } else {
                     for &idx in &touched {
-                        self.renderer.update_leaf(&self.structure, idx);
+                        // The viewer renders in palette mode, where these are
+                        // infallible (the truecolor build-once guard never trips).
+                        // P5 wires the truecolor viewer branch (re-bake on edit).
+                        let _ = self.renderer.update_leaf(&self.structure, idx);
+                        let _ = self.renderer.update_leaf_mat(&self.structure, idx);
                     }
                 }
             }
@@ -754,7 +868,7 @@ impl Viewer {
 
         let header = format!(
             "{} {}^3",
-            self.fixture.label(),
+            self.scene_label,
             self.resolution.voxels_per_axis()
         );
         let stats = [
@@ -819,6 +933,148 @@ impl Viewer {
         );
         b
     }
+}
+
+/// Voxelizes a mesh file into the sparse structure, sharing the viewer's GPU
+/// device via [`GpuVoxelizer::from_device`] (one device for both voxelizing and
+/// rendering). Returns the live tree + its School-B buffer, like
+/// [`build_structure`]. Occupancy-only (the renderer needs no per-voxel
+/// material), so even a 512³ grid stays within the storage limit.
+fn build_from_mesh(
+    ctx: &GpuContext,
+    resolution: Resolution,
+    path: &Path,
+    padding: f32,
+    rotation: Mat4,
+    truecolor: bool,
+) -> Result<(SparseTree, SchoolBBuffer, MaterialTable)> {
+    let mut mesh = load_mesh(path).with_context(|| format!("loading mesh {}", path.display()))?;
+    eprintln!("  {} triangles", mesh.triangles.len());
+    // Re-orient transform-less formats before measuring the bounding box.
+    if rotation != Mat4::IDENTITY {
+        mesh.transform(rotation);
+    }
+    // Drop toon-outline inverted hulls (named "outline", untextured, near-black) — a
+    // surface voxelizer can't cull them, so they'd coat the model in a solid black
+    // shell. Truecolor only: the occupancy/palette paths keep the raw geometry. Done
+    // before the grid fit so the bounds track the real surface, not the inflated hull.
+    if truecolor {
+        let outlines = mesh.drop_outline_triangles();
+        if outlines > 0 {
+            eprintln!("  dropped {outlines} toon-outline triangles (black inverted-hull)");
+        }
+    }
+    let grid = VoxelGrid::fit_mesh(resolution, &mesh, padding);
+    let opts = VoxelizeOpts {
+        epsilon: 1e-4,
+        // The compact pass resolves owner→material per occupied voxel.
+        store_owner: true,
+        store_color: false,
+    };
+    let vox = pollster::block_on(GpuVoxelizer::from_device(
+        &ctx.device,
+        &ctx.queue,
+        GpuVoxelizerConfig::default(),
+    ))?;
+
+    // The SPARSE path: occupancy-bounded (no dense n³ owner grid), so it scales to
+    // 2048³ (docs/materials/09). The GPU compact pass yields one
+    // `(coord, global material id)` per occupied voxel; `tree_from_compact`
+    // re-bins those into the renderer's 8³ leaves and fills materials.
+    let (table, packed) = voxelizer::material_table_for_sparse(&mesh)?;
+    let voxels =
+        pollster::block_on(vox.compact_surface_sparse(&mesh, &grid, &opts, &packed, [0, 0, 0]))?;
+
+    // MASK alpha-cutout (truecolor only), then build the renderer tree + buffer.
+    let voxels = if truecolor {
+        apply_mask_cutout(&voxels, &mesh, &grid, opts.epsilon, &packed)
+    } else {
+        voxels
+    };
+    let (tree, dropped) = voxelizer::tree_from_compact(resolution, &voxels);
+    if dropped > 0 {
+        eprintln!("  {dropped} voxels fell outside the fitted grid (dropped)");
+    }
+    eprintln!(
+        "  {} occupied voxels → {} leaves",
+        voxels.len(),
+        tree.leaf_count()
+    );
+    let mut structure = SchoolBBuffer::from_sparse(&tree);
+
+    // Optional per-voxel truecolor bake.
+    if truecolor {
+        bake_truecolor_if_textured(
+            &mut structure,
+            &tree,
+            &mesh,
+            &grid,
+            opts.epsilon,
+            &packed,
+            voxels.len(),
+        )?;
+    }
+    Ok((tree, structure, table))
+}
+
+/// Drop voxels on a glTF MASK material's transparent texels **before** the tree
+/// is built — clearing occupancy after would corrupt `occupied_rank`. BLEND
+/// glass is kept for Phase 2 compositing.
+fn apply_mask_cutout(
+    voxels: &[CompactVoxel],
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    epsilon: f32,
+    packed: &[u32],
+) -> Vec<CompactVoxel> {
+    let kept = voxelizer::cull_mask_cutout(voxels, mesh, grid, epsilon, Some(packed));
+    let dropped = voxels.len() - kept.len();
+    if dropped > 0 {
+        eprintln!("  alpha-cutout dropped {dropped} MASK voxels");
+    }
+    kept
+}
+
+/// Bake per-voxel truecolor into `structure` (docs/materials/11), which routes
+/// the renderer through the truecolor pipeline. Requires a textured glTF (an
+/// untextured mesh bakes flat white, so it keeps the palette path). Rejects an
+/// over-ceiling scene before the multi-hundred-MB CPU bake (C1) — the GPU probe
+/// would reject it at renderer construction anyway, but only after wasted work.
+///
+/// # Errors
+/// Returns an error if the scene exceeds [`voxel_gpu::MAX_TRUECOLOR_VOXELS`].
+fn bake_truecolor_if_textured(
+    structure: &mut SchoolBBuffer,
+    tree: &SparseTree,
+    mesh: &MeshInput,
+    grid: &VoxelGrid,
+    epsilon: f32,
+    packed: &[u32],
+    voxel_count: usize,
+) -> Result<()> {
+    if mesh.appearance.is_none() {
+        eprintln!("  --truecolor ignored: mesh has no textures (rendering palette)");
+        return Ok(());
+    }
+    if voxel_count > voxel_gpu::MAX_TRUECOLOR_VOXELS {
+        anyhow::bail!(
+            "truecolor scene has {voxel_count} occupied voxels, over the {}-voxel colour \
+             ceiling; lower --res or split the mesh",
+            voxel_gpu::MAX_TRUECOLOR_VOXELS,
+        );
+    }
+    eprintln!("  baking per-voxel truecolor…");
+    let t = Instant::now();
+    // `packed` constrains the colour owner to each voxel's own material so the
+    // bake can't sample a neighbouring surface's texture (the wrong-side bleed);
+    // it's the same per-triangle material stream the compaction used.
+    voxelizer::bake_leaf_colors(structure, tree, mesh, grid, epsilon, Some(packed));
+    eprintln!(
+        "  truecolor baked: {} voxel colours in {:.1}s",
+        structure.leaf_color_words().len(),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Builds the [`SparseTree`] for a noise fixture, evaluating the occupancy on the

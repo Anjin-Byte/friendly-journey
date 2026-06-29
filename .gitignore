@@ -1,5 +1,9 @@
 /target
+# A member crate built standalone (before joining the workspace) leaves its own
+# target/; ignore those too so they never get committed.
+**/target/
 **/*.rs.bk
+.DS_Store
 
 # GPU profiler captures (make trace / programmatic .gputrace).
 *.trace
@@ -7,3 +11,14 @@
 
 # Symlinked engineering standards vault (see CLAUDE.md / README).
 Engineering_Codex
+
+# Vendored external clones — each is its own git repo (STBN blue noise, XeGTAO
+# reference, OIDN denoiser source), not part of this repo's history. They were
+# tracked as accidental gitlinks; ignored here after `git rm --cached`.
+/STBN/
+/XeGTAO/
+/oidn/
+crates/voxelizer/docs
+docs
+reference_code_for_materials
+models
