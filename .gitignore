@@ -22,3 +22,8 @@ crates/voxelizer/docs
 docs
 reference_code_for_materials
 models
+
+CAPTURE.md
+caves-perf.md
+idea.md
+FINDINGS.md
